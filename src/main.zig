@@ -28,6 +28,7 @@ pub const Position = struct {
 
 pub const Cat = struct {
     color: rl.Color,
+    texture: *const rl.Texture2D,
     wanted_direction: ?Direction,
     position: Position,
 };
@@ -152,6 +153,14 @@ pub const GameView = struct {
         max_x: f32,
         min_y: f32,
         max_y: f32,
+
+        pub fn x_span(self: @This()) f32 {
+            return self.max_x - self.min_x;
+        }
+
+        pub fn y_span(self: @This()) f32 {
+            return self.max_y - self.min_y;
+        }
     };
 
     on_screen: Spec,
@@ -174,6 +183,11 @@ pub const GameView = struct {
         return .init(x, y);
         // zig fmt: on
     }
+
+    pub fn scale_to_screen(self: Self, length_in_game: f32) f32 {
+        // HACK
+        return map(length_in_game, 0, self.in_game.x_span(), 0, self.on_screen.x_span());
+    }
 };
 
 pub fn main() anyerror!void {
@@ -187,6 +201,9 @@ pub fn main() anyerror!void {
 
     var _gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     const gpa = _gpa.allocator();
+
+    var static_arena = ArenaAllocator.init(gpa);
+    defer static_arena.deinit();
 
     var round_arena = ArenaAllocator.init(gpa);
     defer round_arena.deinit();
@@ -204,6 +221,14 @@ pub fn main() anyerror!void {
     const game_view = GameView{
         .in_game = .{ .min_x = 0, .min_y = 0, .max_x = @floatFromInt(grid.width), .max_y = @floatFromInt(grid.height) },
         .on_screen = .{ .min_x = 10, .min_y = 10, .max_x = 800 - 20, .max_y = 800 - 20 },
+    };
+
+    const cat_texture = blk: {
+        var image = try rl.loadImage("assets/cat.png");
+        const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
+        image.resize(new_side_length, new_side_length);
+        image.tint(rl.Color.pink.brightness(0.8));
+        break :blk try rl.Texture.fromImage(image);
     };
     const game_map =
         //01234567890123456789
@@ -247,6 +272,7 @@ pub fn main() anyerror!void {
     var cats = try std.ArrayList(Cat).initCapacity(round_arena.allocator(), 1);
     try cats.append(round_arena.allocator(), Cat{
         .color = rl.Color.red,
+        .texture = &cat_texture,
         .wanted_direction = null,
         .position = .{ .x = 4, .y = 5 },
     });
@@ -262,6 +288,8 @@ pub fn main() anyerror!void {
     rl.setTargetFPS(60); // Set our game to run at 60 frames-per-second
     //--------------------------------------------------------------------------------------
 
+    var thicness: f32 = 0.1;
+
     // Main game loop
     while (!rl.windowShouldClose()) { // Detect window close button or ESC key
         defer std.debug.assert(frame_arena.reset(.retain_capacity));
@@ -271,6 +299,8 @@ pub fn main() anyerror!void {
         if (rl.isKeyPressed(.space)) {
             pause = !pause;
         }
+
+        thicness += rl.getMouseWheelMove() / 100;
 
         if (!pause) {
             for (players) |player| {
@@ -303,27 +333,50 @@ pub fn main() anyerror!void {
         rl.beginDrawing();
         defer rl.endDrawing();
 
-        rl.clearBackground(.ray_white);
+        rl.clearBackground(.init(242, 242, 242, 255));
 
-        // rl.drawCircleV(ballPosition, ballRadius, .maroon);
-        // rl.drawText("PRESS SPACE to PAUSE BALL MOVEMENT", 10, rl.getScreenHeight() - 25, 20, .light_gray);
+        const lines_color = rl.Color.white;
+        const line_thickness = game_view.scale_to_screen(thicness);
+        {
+            // Draw horizontal tiles
+            for (0..@intCast(grid.height + 1)) |y_in_game| {
+                var start = game_view.screen_coordinates_from_position(.{ .x = 0, .y = @intCast(y_in_game) });
+                start = start.add(.{ .x = 0, .y = -line_thickness / 2 });
+                rl.drawRectangleV(start, .{ .x = game_view.on_screen.x_span(), .y = line_thickness }, lines_color);
+            }
+            // Draw vertical tiles
+            for (0..@intCast(grid.width + 1)) |x_in_game| {
+                var start = game_view.screen_coordinates_from_position(.{ .x = @intCast(x_in_game), .y = 0 });
+                start = start.add(.{ .x = -line_thickness / 2, .y = 0 });
+                rl.drawRectangleV(start, .{ .x = line_thickness, .y = game_view.on_screen.y_span() }, lines_color);
+            }
+        }
 
-        const tile_size_length = 27;
-        const tile_size = rl.Vector2.init(tile_size_length, tile_size_length);
+        const tile_size_on_screen = game_view.scale_to_screen(1) * 1.03;
         var tiles_iterator = grid.iterator();
         while (tiles_iterator.next()) |item| {
             const coords = game_view.screen_coordinates_from_position(item.position);
-            rl.drawRectangleV(coords, tile_size.subtractValue(0.1), .light_gray);
 
             switch (item.tile.*) {
                 .cat => |cat| {
-                    rl.drawRectangleRounded(.init(coords.x, coords.y, tile_size.x - 0.1, tile_size.y - 0.1), 0.1, 0, cat.color);
+                    rl.drawTexture(cat.texture.*, @intFromFloat(coords.x), @intFromFloat(coords.y), .white);
+                    rl.drawTexture(cat.texture.*, @intFromFloat(coords.x), @intFromFloat(coords.y), .white);
+
+                    // rl.drawRectangleRounded(.init(coords.x, coords.y, tile_size_on_screen, tile_size_on_screen), 0.3, 0, rl.Color{.a});
+                    // const o = game_view.scale_to_screen(0.1);
+                    // rl.drawRectangleRounded(.init(coords.x + o, coords.y + o, tile_size_on_screen - 2 * o, tile_size_on_screen - 2 * o), 0.3, 8, cat.color);
                 },
                 .empty => {
                     // nothing
                 },
                 .wall => {
-                    rl.drawRectangleV(coords, tile_size, .dark_gray);
+                    rl.drawRectangle(
+                        @intFromFloat(coords.x),
+                        @intFromFloat(coords.y),
+                        @intFromFloat(tile_size_on_screen),
+                        @intFromFloat(tile_size_on_screen),
+                        .dark_gray,
+                    );
                 },
             }
 
