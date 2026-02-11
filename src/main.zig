@@ -1,13 +1,20 @@
 const DEBUG = false;
+comptime {
+    @setFloatMode(.optimized); // >:) (this will surely not bite us later)
+}
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 const ArenaAllocator = std.heap.ArenaAllocator;
+
 const rl = @import("raylib");
 
 const Vector2 = rl.Vector2;
 const Vector3 = rl.Vector3;
 const Vector4 = rl.Vector4;
+const Color = rl.Color;
 
 pub const Position = struct {
     x: i32,
@@ -26,11 +33,128 @@ pub const Position = struct {
     }
 };
 
-pub const Cat = struct {
-    color: rl.Color,
-    texture: *const rl.Texture2D,
-    wanted_direction: ?Direction,
+pub const Timestamp = struct {
+    seconds_from_beginning: f64,
+
+    const Self = @This();
+    pub fn is_before(self: Self, rhs: Timestamp) bool {
+        return self.seconds_from_beginning < rhs.seconds_from_beginning;
+    }
+
+    pub fn duration_to(self: Self, final: Timestamp) Duration {
+        return Duration{
+            .seconds = @floatCast(final.seconds_from_beginning - self.seconds_from_beginning),
+        };
+    }
+
+    pub fn plus_duration(self: Self, to_add: Duration) Timestamp {
+        return Timestamp{
+            .seconds_from_beginning = self.seconds_from_beginning + to_add.seconds,
+        };
+    }
+};
+
+pub const Duration = struct {
+    seconds: f32,
+
+    const Self = @This();
+
+    pub fn from_seconds(seconds: f32) Duration {
+        return .{ .seconds = seconds };
+    }
+};
+
+pub const Timer = struct {
+    start: Timestamp,
+    end: Timestamp,
+
+    const Self = @This();
+
+    pub fn init(params: struct { current_time: Timestamp, total_duration: Duration }) Timer {
+        return .{
+            .start = params.current_time,
+            .end = params.current_time.plus_duration(params.total_duration),
+        };
+    }
+
+    pub fn finished(self: Self, current_time: Timestamp) bool {
+        return self.end.is_before(current_time);
+    }
+
+    pub fn planned_total_duration(self: Self) Duration {
+        return self.start.duration_to(self.end);
+    }
+
+    pub fn progress_from_0_to_1(self: Self, current_time: Timestamp) f32 {
+        const actual_seconds = self.start.duration_to(current_time);
+        const total_seconds = self.planned_total_duration();
+        return actual_seconds / total_seconds;
+    }
+};
+
+pub const Health = struct {
+    points: i32,
+
+    const Self = @This();
+
+    pub const indestructible = null;
+
+    pub fn add_mut(self: *Self, other: Health) void {
+        self.points += other.points;
+    }
+    pub fn sub_mut(self: *Self, other: Health) void {
+        self.points -= other.points;
+        if (self.points < 0) self.points = 0;
+    }
+    pub fn means_dead(self: Self) bool {
+        return self.points <= 0;
+    }
+};
+
+pub const Entity = struct {
+    /// `null` means indestructible
+    health: ?Health,
     position: Position,
+    type: Type,
+
+    const Self = @This();
+    pub fn deal_damage(self: *Self, damage: Health) void {
+        if (self.health) |*health| {
+            health.sub_mut(damage);
+        }
+    }
+
+    pub const Type = union(enum) {
+        cat: *Cat,
+        bomb: *Bomb,
+        wall,
+    };
+};
+
+pub const Cat = struct {
+    as_entity: *Entity,
+    controlling_player: ?*Player,
+    color: rl.Color,
+    wanted_direction: ?Direction,
+
+    const Self = @This();
+    pub fn position(self: *Self) *Position {
+        return &self.as_entity.position;
+    }
+};
+
+pub const Bomb = struct {
+    as_entity: *Entity,
+    damage: i32,
+    blast_radius_in_tiles: i32,
+    timer: Timer,
+
+    pub const Properties = struct {
+        starting_health: ?Health,
+        damage: Health,
+        blast_radius_in_tiles: i32,
+        time_to_detonate: Duration,
+    };
 };
 
 pub const Direction = enum {
@@ -48,38 +172,105 @@ pub const Controls = struct {
 };
 
 pub const Player = struct {
-    cat: *Cat,
+    cat: ?*Cat,
     controls: Controls,
+    bomb_creation_properties: Bomb.Properties,
 };
 
-pub const Tile = union(enum) {
-    cat: *Cat,
-    wall,
-    empty,
+pub fn FixedArray(comptime Item: type) type {
+    return struct {
+        capacity: usize,
+        items: []Item,
 
-    const Self = @This();
-    pub const Tag = std.meta.Tag(Tile);
-    pub fn tag(self: Self) Tag {
-        return std.meta.activeTag(self);
-    }
-};
+        const Self = @This();
+
+        pub fn init(buffer: []Item) Self {
+            var items = buffer;
+            items.len = 0;
+            return .{ .capacity = buffer.len, .items = items };
+        }
+
+        pub fn try_append(self: *Self, item: Item) struct { ok: bool } {
+            if (self.capacity == self.items.len) {
+                return .{ .ok = false };
+            }
+            self.items.len += 1;
+            self.items[self.items.len - 1] = item;
+            return .{ .ok = true };
+        }
+
+        pub fn append_assert_ok(self: *Self, item: Item) void {
+            assert(self.try_append(item).ok);
+        }
+
+        pub fn len(self: Self) usize {
+            return self.items.len;
+        }
+
+        pub fn last(self: Self) *Item {
+            return &self.items[self.len() - 1];
+        }
+
+        pub fn is_empty(self: Self) bool {
+            return self.items.len == 0;
+        }
+
+        pub fn non_empty(self: Self) bool {
+            return self.items.len != 0;
+        }
+
+        pub fn swap_remove_at(self: *Self, at_index: usize) Item {
+            const result = self.items[at_index];
+            if (self.len() == at_index + 1) {
+                self.items.len -= 1;
+                return result;
+            }
+            std.mem.swap(Item, &self.items[at_index], self.last());
+            self.items.len -= 1;
+            return result;
+        }
+
+        pub fn swap_remove(self: *Self, item: Item) struct { was_found_and_removed: bool } {
+            const index = for (self.items, 0..) |i, index| {
+                if (i == item) break index;
+            } else return .{ .was_found_and_removed = false };
+
+            _ = self.swap_remove_at(index);
+            return .{ .was_found_and_removed = true };
+        }
+    };
+}
 
 pub const Grid = struct {
     width: i32,
     height: i32,
+    depth: usize,
+    all_items: []*Entity,
     tiles: []Tile,
 
+    pub const Tile = FixedArray(*Entity);
+
     const Self = @This();
-    pub fn init(gpa: Allocator, width: i32, height: i32) Allocator.Error!Self {
+    pub fn init(gpa: Allocator, width: i32, height: i32, depth: usize) Allocator.Error!Self {
+        const all_items = try gpa.alloc(*Entity, as(usize, width * height) * depth);
         const tiles = try gpa.alloc(Tile, @intCast(width * height));
-        for (tiles) |*tile| {
-            tile.* = .empty;
+
+        for (tiles, 0..) |*tile, index| {
+            const start = index * depth;
+            const buffer = all_items[start .. start + depth];
+            tile.* = Tile.init(buffer);
         }
-        return Self{ .width = width, .height = height, .tiles = tiles };
+
+        return Self{
+            .width = width,
+            .height = height,
+            .depth = depth,
+            .all_items = all_items,
+            .tiles = tiles,
+        };
     }
 
-    pub fn at(self: *Self, position: Position) *Tile {
-        const index = position.y * self.width + position.x;
+    pub fn index_from_position(self: Self, position: Position) usize {
         if (position.x < 0 or position.x >= self.width) {
             @branchHint(.cold);
             std.debug.panic(
@@ -94,6 +285,11 @@ pub const Grid = struct {
                 .{ position.x, position.y, self.width, self.height },
             );
         }
+        return as(usize, position.y * self.width + position.x);
+    }
+
+    pub fn at(self: *Self, position: Position) *Tile {
+        const index = self.index_from_position(position);
         return &self.tiles[@intCast(index)];
     }
 
@@ -101,6 +297,14 @@ pub const Grid = struct {
         const index = position.y * self.width + position.x;
         if (index >= self.tiles.len) return null;
         return &self.tiles[@intCast(index)];
+    }
+
+    pub fn move_assert_ok(self: *Self, entity: *Entity, to: Position) void {
+        const old_position = entity.position;
+        const new_position = to;
+        entity.position = new_position;
+        assert(self.at(old_position).swap_remove(entity).was_found_and_removed);
+        self.at(new_position).append_assert_ok(entity);
     }
 
     pub fn iterator(self: *Self) TilesIterator {
@@ -124,8 +328,12 @@ pub const Grid = struct {
     };
 };
 
-pub fn as_f32(number: anytype) f32 {
-    return @as(f32, @floatFromInt(number));
+pub inline fn as(comptime Out: type, number: anytype) Out {
+    switch (@typeInfo(Out)) {
+        .int => |int| assert(int.signedness != .unsigned or number >= 0),
+        else => {},
+    }
+    return std.math.lossyCast(Out, number);
 }
 
 pub const Screen = struct {
@@ -190,6 +398,96 @@ pub const GameView = struct {
     }
 };
 
+// pub fn Set(comptime T: type) type {
+//     return struct {
+
+//         // elements:
+
+//         const Self = @This();
+//         pub const Item = struct {};
+//     };
+// }
+
+pub const GameState = struct {
+    gpa: Allocator,
+    entities: std.ArrayList(Entity),
+    cats: std.ArrayList(Cat),
+    bombs: std.ArrayList(Bomb),
+
+    cat_texture: rl.Texture,
+    bomb_texture: rl.Texture,
+
+    grid: Grid,
+
+    const Self = @This();
+
+    pub const CreateCatParams = struct {
+        controlling_player: ?*Player,
+        starting_health: Health,
+        position: Position,
+        color: rl.Color,
+    };
+    pub fn create_cat(self: *Self, params: CreateCatParams) Allocator.Error!*Cat {
+        const entity = try self.entities.addOne(self.gpa);
+        const cat = try self.cats.addOne(self.gpa);
+        entity.* = .{
+            .health = params.starting_health,
+            .position = params.position,
+            .type = .{ .cat = cat },
+        };
+        cat.* = .{
+            .as_entity = entity,
+            .color = params.color,
+            .controlling_player = params.controlling_player,
+            .wanted_direction = null,
+        };
+        assert(self.grid.at(params.position).try_append(entity).ok);
+        return cat;
+    }
+
+    pub const CreateBombParams = struct {
+        position: Position,
+        current_time: Timestamp,
+        properties: Bomb.Properties,
+    };
+    pub fn create_bomb(self: *Self, params: CreateBombParams) Allocator.Error!*Bomb {
+        const entity = try self.entities.addOne(self.gpa);
+        const bomb = try self.bombs.addOne(self.gpa);
+
+        entity.* = .{
+            .health = params.properties.starting_health,
+            .position = params.position,
+            .type = .{ .bomb = bomb },
+        };
+
+        bomb.* = .{
+            .as_entity = entity,
+            .damage = params.properties.damage,
+            .blast_radius_in_tiles = params.properties.blast_radius_in_tiles,
+            .time_detonate_in_frames = params.properties.time_detonate_in_frames,
+            .total_detonation_time_in_frame = params.properties.total_detonation_time_in_frame,
+        };
+
+        assert(self.grid.at(params.position).try_append(entity).ok);
+        return bomb;
+    }
+
+    pub const CreateWallParams = struct {
+        health: ?Health,
+        position: Position,
+    };
+    pub fn create_wall(self: *Self, params: CreateWallParams) Allocator.Error!*Entity {
+        const wall: *Entity = try self.entities.addOne(self.gpa);
+        wall.* = .{
+            .health = params.health,
+            .position = params.position,
+            .type = .wall,
+        };
+        assert(self.grid.at(params.position).try_append(wall).ok);
+        return wall;
+    }
+};
+
 pub fn main() anyerror!void {
     // Initialization
     //--------------------------------------------------------------------------------------
@@ -217,7 +515,7 @@ pub fn main() anyerror!void {
     var pause: bool = false;
     var framesCounter: i32 = 0;
 
-    var grid = try Grid.init(round_arena.allocator(), 20, 20);
+    var grid = try Grid.init(round_arena.allocator(), 20, 20, 20);
     const game_view = GameView{
         .in_game = .{ .min_x = 0, .min_y = 0, .max_x = @floatFromInt(grid.width), .max_y = @floatFromInt(grid.height) },
         .on_screen = .{ .min_x = 10, .min_y = 10, .max_x = 800 - 20, .max_y = 800 - 20 },
@@ -227,32 +525,47 @@ pub fn main() anyerror!void {
         var image = try rl.loadImage("assets/cat.png");
         const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
         image.resize(new_side_length, new_side_length);
-        image.tint(rl.Color.pink.brightness(0.8));
+        break :blk try rl.Texture.fromImage(image);
+    };
+    const bomb_texture = blk: {
+        var image = try rl.loadImage("assets/bomb.png");
+        const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
+        image.resize(new_side_length, new_side_length);
         break :blk try rl.Texture.fromImage(image);
     };
     const game_map =
         //01234567890123456789
         \\wwwwwwwwwwwwwwwwwwww
         \\w          wwwwwwwww
-        \\w          wwwwwwwww
-        \\w                  w
+        \\w   ww           www
+        \\w          wwwww www
         \\w                  w
         \\w  w    w          w
         \\w       w          w
         \\w       w          w
         \\w       w          w
-        \\w      wwwwwww     w
+        \\w     wwwwwwww     w
         \\w       w          w
         \\w       w          w
         \\w  w               w
-        \\w        w    wwwwww
-        \\w             wwwwww
-        \\w             wwwwww
-        \\w             wwwwww
-        \\w             wwwwww
-        \\ww           wwwwwww
+        \\w        w    ww www
+        \\w             ww www
+        \\w             ww www
+        \\w             ww www
+        \\ww           www www
+        \\ww               www
         \\wwwwwwwwwwwwwwwwwwww
     ;
+
+    var state = GameState{
+        .gpa = round_arena.allocator(),
+        .cat_texture = cat_texture,
+        .bomb_texture = bomb_texture,
+        .bombs = try .initCapacity(round_arena.allocator(), 0),
+        .cats = try .initCapacity(round_arena.allocator(), 0),
+        .entities = try .initCapacity(round_arena.allocator(), 0),
+        .grid = grid,
+    };
 
     for (0..@intCast(grid.height)) |y| {
         for (0..@intCast(grid.width)) |x| {
@@ -261,29 +574,34 @@ pub fn main() anyerror!void {
             const char = game_map[map_index];
             std.debug.print("{c}", .{char});
             if (char == 'w') {
-                grid.at(.{ .x = @intCast(x), .y = @intCast(y) }).* = .wall;
-            } else {
-                grid.at(.{ .x = @intCast(x), .y = @intCast(y) }).* = .empty;
+                _ = try state.create_wall(.{
+                    .position = .{ .x = as(i32, x), .y = as(i32, y) },
+                    .health = .indestructible,
+                });
             }
         }
         std.debug.print("\n", .{});
     }
 
-    var cats = try std.ArrayList(Cat).initCapacity(round_arena.allocator(), 1);
-    try cats.append(round_arena.allocator(), Cat{
-        .color = rl.Color.red,
-        .texture = &cat_texture,
-        .wanted_direction = null,
-        .position = .{ .x = 4, .y = 5 },
-    });
-
-    for (cats.items) |*cat| {
-        grid.at(cat.position).* = .{ .cat = cat };
-    }
-    const players = &[_]Player{.{
-        .cat = &cats.items[0],
+    var _players_buffer: [10]Player = undefined;
+    var players = ArrayList(Player).initBuffer(&_players_buffer);
+    players.appendAssumeCapacity(.{
+        .cat = null,
         .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d },
-    }};
+        .bomb_creation_properties = Bomb.Properties{
+            .blast_radius_in_tiles = 1,
+            .damage = Health{ .points = 5 },
+            .starting_health = Health.indestructible,
+            .time_to_detonate = Duration.from_seconds(4),
+        },
+    });
+    const player_cat = try state.create_cat(.{
+        .color = Color.red.brightness(0.8),
+        .controlling_player = &players.items[0],
+        .position = .{ .x = 1, .y = 5 },
+        .starting_health = Health{ .points = 15 },
+    });
+    players.items[0].cat = player_cat;
 
     rl.setTargetFPS(60); // Set our game to run at 60 frames-per-second
     //--------------------------------------------------------------------------------------
@@ -303,25 +621,24 @@ pub fn main() anyerror!void {
         thicness += rl.getMouseWheelMove() / 100;
 
         if (!pause) {
-            for (players) |player| {
-                if (rl.isKeyPressed(player.controls.up)) player.cat.wanted_direction = .up;
-                if (rl.isKeyPressed(player.controls.left)) player.cat.wanted_direction = .left;
-                if (rl.isKeyPressed(player.controls.right)) player.cat.wanted_direction = .right;
-                if (rl.isKeyPressed(player.controls.down)) player.cat.wanted_direction = .down;
+            for (players.items) |*player| {
+                if (rl.isKeyPressed(player.controls.up)) player.cat.?.wanted_direction = .up;
+                if (rl.isKeyPressed(player.controls.left)) player.cat.?.wanted_direction = .left;
+                if (rl.isKeyPressed(player.controls.right)) player.cat.?.wanted_direction = .right;
+                if (rl.isKeyPressed(player.controls.down)) player.cat.?.wanted_direction = .down;
             }
 
-            for (cats.items) |*cat| {
+            for (state.cats.items) |*cat| {
                 defer cat.wanted_direction = null;
                 const wanted_direction = cat.wanted_direction orelse continue;
 
-                const old_position = cat.position;
+                var final_position = cat.position().*;
                 while (true) {
-                    const new_position = cat.position.add(wanted_direction);
-                    if (grid.at(new_position).tag() != .empty) break;
-                    cat.position = new_position;
+                    const next_position = final_position.add(wanted_direction);
+                    if (state.grid.at(next_position).non_empty()) break;
+                    final_position = next_position;
                 }
-                grid.at(old_position).* = .empty;
-                grid.at(cat.position).* = .{ .cat = cat };
+                state.grid.move_assert_ok(cat.as_entity, final_position);
             }
         } else {
             framesCounter += 1;
@@ -356,28 +673,26 @@ pub fn main() anyerror!void {
         var tiles_iterator = grid.iterator();
         while (tiles_iterator.next()) |item| {
             const coords = game_view.screen_coordinates_from_position(item.position);
-
-            switch (item.tile.*) {
-                .cat => |cat| {
-                    rl.drawTexture(cat.texture.*, @intFromFloat(coords.x), @intFromFloat(coords.y), .white);
-                    rl.drawTexture(cat.texture.*, @intFromFloat(coords.x), @intFromFloat(coords.y), .white);
-
-                    // rl.drawRectangleRounded(.init(coords.x, coords.y, tile_size_on_screen, tile_size_on_screen), 0.3, 0, rl.Color{.a});
-                    // const o = game_view.scale_to_screen(0.1);
-                    // rl.drawRectangleRounded(.init(coords.x + o, coords.y + o, tile_size_on_screen - 2 * o, tile_size_on_screen - 2 * o), 0.3, 8, cat.color);
-                },
-                .empty => {
-                    // nothing
-                },
-                .wall => {
-                    rl.drawRectangle(
-                        @intFromFloat(coords.x),
-                        @intFromFloat(coords.y),
-                        @intFromFloat(tile_size_on_screen),
-                        @intFromFloat(tile_size_on_screen),
-                        .dark_gray,
-                    );
-                },
+            const x_int = as(i32, coords.x);
+            const y_int = as(i32, coords.y);
+            for (item.tile.items) |entity| {
+                switch (entity.type) {
+                    .cat => |cat| {
+                        rl.drawTexture(cat_texture, x_int, y_int, cat.color);
+                    },
+                    .wall => {
+                        rl.drawRectangle(
+                            x_int,
+                            y_int,
+                            as(i32, tile_size_on_screen),
+                            as(i32, tile_size_on_screen),
+                            rl.Color.dark_blue.contrast(-0.6),
+                        );
+                    },
+                    .bomb => {
+                        rl.drawTexture(bomb_texture, x_int, y_int, .white);
+                    },
+                }
             }
 
             if (DEBUG) {
