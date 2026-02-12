@@ -19,6 +19,14 @@ const Vector3 = rl.Vector3;
 const Vector4 = rl.Vector4;
 const Color = rl.Color;
 
+const pi = 3.14159265358979;
+
+pub fn cap_0_1(x: f32) f32 {
+    if (x < 0) return 0;
+    if (x > 1) return 1;
+    return x;
+}
+
 pub const Position = struct {
     x: i32,
     y: i32,
@@ -96,8 +104,8 @@ pub const Timer = struct {
     }
 
     pub fn progress_from_0_to_1(self: Self, current_time: Timestamp) f32 {
-        const actual_seconds = self.start.duration_to(current_time);
-        const total_seconds = self.planned_total_duration();
+        const actual_seconds = self.start.duration_to(current_time)._seconds;
+        const total_seconds = self.planned_total_duration()._seconds;
         return actual_seconds / total_seconds;
     }
 
@@ -909,6 +917,12 @@ pub fn main() anyerror!void {
         image.resize(new_side_length, new_side_length);
         break :blk try rl.Texture.fromImage(image);
     };
+    const fire_texture = blk: {
+        var image = try rl.loadImage("assets/fire1.png");
+        const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
+        image.resize(new_side_length, new_side_length);
+        break :blk try rl.Texture.fromImage(image);
+    };
     const game_map =
         //01234567890123456789
         \\wwwwwwwwwwwwwwwwwwww
@@ -1058,10 +1072,10 @@ pub fn main() anyerror!void {
                 var starting_damage = bomb.damage;
                 _ = starting_damage.sub_mut(state.deal_damage_at(bomb_entity.position, bomb.damage, bomb.entity).damage_dealt);
 
-                const base_effect_timer = current_time.timer_that_goes_off_in(.seconds(0.8));
+                const base_effect_timer = current_time.timer_that_goes_off_in(.seconds(0.3));
                 _ = try state.create_visual_effect(VisualEffect{
                     .position = bomb_entity.position,
-                    .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
+                    .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.1)),
                     .type = .fire,
                 });
 
@@ -1079,7 +1093,7 @@ pub fn main() anyerror!void {
                         }
                         _ = try state.create_visual_effect(VisualEffect{
                             .position = position,
-                            .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
+                            .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.1)),
                             .type = .fire,
                         });
                     }
@@ -1124,7 +1138,7 @@ pub fn main() anyerror!void {
             }
         }
 
-        const tile_size_on_screen = game_view.scale_to_screen(1) * 1.03;
+        const tile_size_on_screen = game_view.scale_to_screen(1) * 1.02;
         var tiles_iterator = grid.iterator();
         while (tiles_iterator.next()) |item| {
             const coords = game_view.screen_coordinates_from_position(item.position);
@@ -1167,8 +1181,6 @@ pub fn main() anyerror!void {
             }
         }
 
-        const fire_width = as(i32, game_view.scale_to_screen(0.5));
-
         var it_visual_effects = state.visual_effects.iterator();
         while (it_visual_effects.next()) |entry| {
             const visual_effect, const visual_effect_handle = entry;
@@ -1184,12 +1196,16 @@ pub fn main() anyerror!void {
             };
 
             const coords = game_view.screen_coordinates_from_position(visual_effect.position);
-            const x_int = as(i32, coords.x);
-            const y_int = as(i32, coords.y);
+            // const x_int = as(i32, coords.x);
+            // const y_int = as(i32, coords.y);
 
             switch (visual_effect.type) {
                 .fire => {
-                    rl.drawRectangle(x_int, y_int, fire_width, fire_width, .red);
+                    // const progress = visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time);
+                    // const scale = cap_0_1(std.math.pow(f32, 1 - progress, 2));
+                    const scale = 1;
+                    const rotation = state.random.float(f32) * 2 * pi;
+                    rl.drawTextureEx(fire_texture, coords, rotation, scale, .white);
                 },
                 .after_dash => |after_dash| {
                     _ = after_dash;
