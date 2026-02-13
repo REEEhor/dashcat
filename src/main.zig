@@ -1,4 +1,5 @@
-const DEBUG = false;
+var DEBUG = false;
+const DO_INVARIANT_ASSERTS = true;
 comptime {
     @setFloatMode(.optimized); // >:) (this will surely not bite us later)
 }
@@ -9,8 +10,10 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const eql = std.meta.eql;
+const Deque = @import("deque.zig").Deque;
 
 const slices = @import("slices.zig");
+const Set = @import("set.zig").Set;
 
 const rl = @import("raylib");
 
@@ -41,6 +44,13 @@ pub const Position = struct {
             .right => result.x += 1,
         }
         return result;
+    }
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("({d},{d})", .{ self.x, self.y });
     }
 };
 
@@ -149,10 +159,10 @@ pub const Entity = struct {
     const Self = @This();
     pub fn deal_damage(self: *Self, damage: Health) struct { is_dead: bool } {
         if (self.health) |*health| {
-            health.sub_mut(damage);
+            _ = health.sub_mut(damage);
             return .{ .is_dead = health.means_dead() };
         }
-        return false;
+        return .{ .is_dead = false };
     }
 
     pub fn is_passable(self: Self) bool {
@@ -160,6 +170,7 @@ pub const Entity = struct {
             .modifier_pickup => true,
             //
             .cat => false,
+            .enemy => false,
             .wall => false,
             .bomb => false,
         };
@@ -168,6 +179,7 @@ pub const Entity = struct {
     pub const Type = union(enum) {
         cat: Set(Cat).Handle,
         bomb: Set(Bomb).Handle,
+        enemy: Set(Enemy).Handle,
         wall,
         modifier_pickup: Set(ModifierPickup).Handle,
 
@@ -183,8 +195,87 @@ pub const Cat = struct {
     controlling_player: ?*Player,
     color: rl.Color,
     wanted_direction: ?Direction,
+    distances_map_handle: ?GameState.DistanceMapHandle,
 
     // TODO: put effects here
+};
+
+pub const Enemy = struct {
+    entity: EntityHandle,
+    type: Type,
+
+    interval_between_movement: Duration,
+    timer_until_next_possible_movement: Timer,
+
+    melee_damage: Health,
+    interval_between_hits: Duration,
+    timer_until_next_possible_hit: Timer,
+
+    const Self = @This();
+
+    pub fn can_do_action(self: Self, current_time: Timestamp) bool {
+        return self.can_hit(current_time) or self.can_move(current_time);
+    }
+
+    pub fn can_move(self: Self, current_time: Timestamp) bool {
+        return self.timer_until_next_possible_movement.finished(current_time);
+    }
+
+    pub fn can_hit(self: Self, current_time: Timestamp) bool {
+        return self.timer_until_next_possible_hit.finished(current_time);
+    }
+
+    pub const Type = union(enum) {
+        /// Goes around the walls, ignores bombs
+        normal,
+    };
+};
+
+pub const DistanceMap = struct {
+    grid: []Distance,
+    width: u32,
+    height: u32,
+
+    pub fn init(gpa: Allocator, width: u32, height: u32) Allocator.Error!DistanceMap {
+        const grid = try gpa.alloc(Distance, width * height);
+        for (0..(height * width)) |index| {
+            grid[index] = infinity;
+        }
+        return .{
+            .grid = grid,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    pub fn is_inside(self: Self, position: Position) bool {
+        if (position.x >= self.width or position.x < 0) return false;
+        if (position.y >= self.height or position.y < 0) return false;
+        return true;
+    }
+
+    pub fn set_all_to_infinity(self: *Self) void {
+        for (self.grid) |*d| d.* = infinity;
+    }
+
+    pub fn distance_at(self: Self, position: Position) Distance {
+        const index = self.get_index(position);
+        return self.grid[index];
+    }
+
+    pub fn distance_at_ptr(self: *Self, position: Position) *Distance {
+        const index = self.get_index(position);
+        return &self.grid[index];
+    }
+
+    pub fn get_index(self: Self, position: Position) usize {
+        assert(self.is_inside(position));
+        return (as(usize, position.y) * self.width) + as(usize, position.x);
+    }
+
+    pub const Distance = u32;
+    pub const infinity: Distance = std.math.maxInt(Distance);
+    const Self = @This();
 };
 
 pub const Bomb = struct {
@@ -228,6 +319,7 @@ pub const Player = struct {
     cat: Set(Cat).Handle,
     controls: Controls,
     bomb_creation_properties: Bomb.Properties,
+    color: rl.Color,
 };
 
 pub fn FixedArray(comptime Item: type) type {
@@ -244,7 +336,7 @@ pub fn FixedArray(comptime Item: type) type {
         }
 
         pub fn try_append(self: *Self, item: Item) struct { ok: bool } {
-            if (self.capacity == self.items.len) {
+            if (self.capacity <= self.items.len) {
                 return .{ .ok = false };
             }
             self.items.len += 1;
@@ -285,7 +377,7 @@ pub fn FixedArray(comptime Item: type) type {
 
         pub fn swap_remove(self: *Self, item: Item) struct { was_found_and_removed: bool } {
             const index = for (self.items, 0..) |i, index| {
-                if (i == item) break index;
+                if (eql(i, item)) break index;
             } else return .{ .was_found_and_removed = false };
 
             _ = self.swap_remove_at(index);
@@ -377,6 +469,12 @@ pub const Grid = struct {
 pub inline fn as(comptime Out: type, number: anytype) Out {
     switch (@typeInfo(Out)) {
         .int => |int| assert(int.signedness != .unsigned or number >= 0),
+        .@"struct" => |info| {
+            const BackingInteger = info.backing_integer.?;
+            assert(number >= 0);
+            const raw: BackingInteger = @truncate(number);
+            return @bitCast(raw);
+        },
         else => {},
     }
     return std.math.lossyCast(Out, number);
@@ -459,158 +557,16 @@ pub const EntityHandle = Set(Entity).Handle;
 //                    0 1 5 3 4 5
 //                        ^
 
-/// The size of a handle is 64 bits.
-/// It consists of 32 bit index into an array and 32 bit generation index.
-/// This type used to store generation indexes is okay, since
-/// even if at every second, there was 1000 entities created, the game
-/// could run for almost 50 days:
-///     (2 ** 32) / 1000 / 60 / 60 / 24 = ~ 49.710269629629636 days
-pub fn Set(comptime Item: type) type {
-    return struct {
-        entries: std.ArrayList(Entry),
-        free_list_head: ?u32,
-        len: usize,
-        next_free_generation: Generation,
-
-        pub const Entry = union(enum) {
-            free: struct { next_free: ?u32 },
-            occupied: struct { generation: Generation, item: Item },
-        };
-
-        pub const Generation = packed struct { n: u32 };
-
-        pub const ItemPtr = *Item;
-
-        pub const Handle = packed struct {
-            generation: Generation,
-            index: u32,
-
-            pub const Set = Self;
-            pub const empty_handle: Handle = .{ .generation = .{ .n = 0 }, .index = std.math.maxInt(u32) };
-        };
-
-        pub fn init_with_capacity(gpa: Allocator, initial_capacity: usize) Allocator.Error!Self {
-            return .{
-                .entries = try std.ArrayList(Entry).initCapacity(gpa, initial_capacity),
-                .free_list_head = null,
-                .len = 0,
-                .next_free_generation = Generation{ .n = 1 }, // So that we know that n=0 is always invalid
-            };
-        }
-
-        pub fn get(self: *Self, handle: Handle) ?*Item {
-            if (handle.index >= self.len) return null;
-            const entry = switch (self.entries.items[handle.index]) {
-                .free => return null,
-                .occupied => |*entry| entry,
-            };
-            if (handle.generation != entry.generation) return null;
-            return &entry.item;
-        }
-
-        pub fn remove(self: *Self, handle: Handle) ?Item {
-            if (handle.index >= self.entries.items.len) return null;
-            const entry: *Entry = &self.entries.items[handle.index];
-            switch (entry.*) {
-                .free => return null,
-                .occupied => |*occupied| {
-                    if (occupied.generation != handle.generation) return null;
-                    const remove_item = occupied.item;
-                    self.next_free_generation.n += 1;
-                    entry.* = .{ .free = .{ .next_free = self.free_list_head } };
-                    self.free_list_head = handle.index;
-                    self.len -= 1;
-                    return remove_item;
-                },
-            }
-        }
-
-        pub fn add_with_pointer(
-            self: *Self,
-            gpa: Allocator,
-            item: Item,
-        ) Allocator.Error!struct { handle: Handle, ptr: *Item } {
-            const generation = self.next_free_generation;
-            self.next_free_generation.n += 1;
-
-            const free_entry: *Entry = blk: {
-                if (self.free_list_head) |free_index| {
-                    // SAFETY: `self.free_list_head` should always point to a `free` item
-                    self.free_list_head = self.entries.items[free_index].free.next_free;
-                    break :blk &self.entries.items[free_index];
-                } else {
-                    // The free list is empty, we have to append the item into the list
-                    break :blk try self.entries.addOne(gpa);
-                }
-            };
-            free_entry.* = .{ .occupied = .{ .generation = generation, .item = item } };
-            const new_item_ptr: *Item = &free_entry.*.occupied.item;
-
-            self.len += 1;
-
-            return .{
-                .handle = Handle{
-                    .generation = generation,
-                    .index = as(u32, index_from_pointer(free_entry, self.entries.items).?),
-                },
-                .ptr = new_item_ptr,
-            };
-        }
-
-        pub fn add(self: *Self, gpa: Allocator, item: Item) Allocator.Error!Handle {
-            return (try self.add_with_pointer(gpa, item)).handle;
-        }
-
-        pub fn iterator(self: *Self) Iterator {
-            return .{ .set = self };
-        }
-
-        pub const Iterator = struct {
-            set: *Self,
-            _index: usize = 0,
-
-            pub fn next(self: *Iterator) ?struct { *Item, Handle } {
-                while (true) {
-                    if (self._index >= self.set.entries.items.len) return null;
-                    defer self._index += 1;
-                    switch (self.set.entries.items[self._index]) {
-                        .free => {},
-                        .occupied => |*occupied| return .{
-                            &occupied.item, Handle{
-                                .generation = occupied.generation,
-                                .index = @intCast(self._index),
-                            },
-                        },
-                    }
-                }
-            }
-        };
-
-        const Self = @This();
-    };
-}
-
-pub fn index_from_pointer(ptr_to_item: anytype, slice: anytype) ?usize {
-    comptime assert(@typeInfo(@TypeOf(slice)).pointer.size == .slice);
-    comptime assert(@typeInfo(@TypeOf(slice)).pointer.child == @typeInfo(@TypeOf(ptr_to_item)).pointer.child);
-
-    const min: usize = @intFromPtr(slice.ptr);
-    const max: usize = @intFromPtr(slice.ptr + slice.len);
-    const value: usize = @intFromPtr(ptr_to_item);
-
-    const check = (min <= value) and (value < max);
-    if (!check) return null;
-
-    return ptr_to_item - slice.ptr;
-}
-
 pub const GameState = struct {
     gpa: Allocator,
 
     entities: Set(Entity),
     cats: Set(Cat),
+    enemies: Set(Enemy),
     bombs: Set(Bomb),
     modifier_pickups: Set(ModifierPickup),
+
+    distances_to_players: std.ArrayList(DistanceMap),
 
     visual_effects: Set(VisualEffect),
 
@@ -620,12 +576,15 @@ pub const GameState = struct {
 
     const Self = @This();
 
+    pub const DistanceMapHandle = packed struct { index: u32 };
+
     pub fn get(self: *Self, handle: anytype) ?@TypeOf(handle).Set.ItemPtr {
         return switch (@TypeOf(handle)) {
             EntityHandle => self.entities.get(handle),
             Set(Cat).Handle => self.cats.get(handle),
             Set(Bomb).Handle => self.bombs.get(handle),
             Set(ModifierPickup).Handle => self.modifier_pickups.get(handle),
+            Set(Enemy).Handle => self.enemies.get(handle),
             else => |Invalid| @compileError(std.fmt.comptimePrint(
                 "Invalid handle type: {s}",
                 .{@typeName(Invalid)},
@@ -654,6 +613,8 @@ pub const GameState = struct {
     }
 
     pub fn deal_damage_at(self: *Self, position: Position, damage: Health, skip: EntityHandle) struct { damage_dealt: Health } {
+        debug_assert_invariants(self);
+        defer debug_assert_invariants(self);
         var total_damage = Health.zero;
         for (self.grid.at(position).items) |entity_handle| {
             if (entity_handle == skip) continue;
@@ -668,14 +629,23 @@ pub const GameState = struct {
     }
 
     pub fn remove_entity(self: *Self, entity_handle: EntityHandle) struct { removal_sucessful: bool } {
-        const entity: *Entity = self.entities.get(entity_handle) orelse return .{ .removal_sucessful = false };
+        debug_assert_invariants(self);
+        defer debug_assert_invariants(self);
+        const entity: Entity = self.entities.remove(entity_handle) orelse return .{ .removal_sucessful = false };
         assert(self.grid.at(entity.position).swap_remove(entity_handle).was_found_and_removed);
         switch (entity.type) {
             .cat => |cat_handle| {
                 const cat = self.cats.remove(cat_handle).?;
+                if (cat.distances_map_handle) |index| {
+                    self.distances_to_players.items[index.index].set_all_to_infinity();
+                }
                 if (cat.controlling_player) |player| {
                     player.cat = .empty_handle;
                 }
+            },
+            .enemy => |enemy_handle| {
+                const enemy = self.enemies.remove(enemy_handle).?;
+                _ = enemy;
             },
             .bomb => |bomb_handle| {
                 const bomb = self.bombs.remove(bomb_handle).?;
@@ -691,12 +661,44 @@ pub const GameState = struct {
     }
 
     pub fn move_assert_ok(self: *Self, entity_handle: EntityHandle, to: Position) void {
-        const entity = self.entities.get(entity_handle) orelse return;
+        const entity = self.entities.get(entity_handle).?;
         const old_position = entity.position;
         const new_position = to;
         entity.position = new_position;
         assert(self.grid.at(old_position).swap_remove(entity_handle).was_found_and_removed);
         self.grid.at(new_position).append_assert_ok(entity_handle);
+    }
+
+    pub fn recalculate_distances_from(
+        self: *Self,
+        temporary_allocator: Allocator,
+        start: Position,
+        distances_handle: DistanceMapHandle,
+    ) Allocator.Error!void {
+        // Do a BFS
+        const distance_map = &self.distances_to_players.items[distances_handle.index];
+        distance_map.set_all_to_infinity();
+
+        const not_visited = DistanceMap.infinity;
+
+        var to_visit = try Deque(Position).initCapacity(temporary_allocator, 10);
+        defer to_visit.deinit(temporary_allocator);
+
+        try to_visit.pushBack(temporary_allocator, start);
+        distance_map.distance_at_ptr(start).* = 0;
+
+        while (to_visit.popFront()) |current_position| {
+            const current_distance = distance_map.distance_at(current_position);
+
+            for (&[_]Direction{ .up, .left, .down, .right }) |direction| {
+                const neighbour_position = current_position.add(direction);
+                if (!distance_map.is_inside(neighbour_position)) continue;
+                if (distance_map.distance_at(neighbour_position) != not_visited) continue;
+                if (!self.is_passable_at(neighbour_position)) continue;
+                distance_map.distance_at_ptr(neighbour_position).* = current_distance + 1;
+                try to_visit.pushBack(temporary_allocator, neighbour_position);
+            }
+        }
     }
 
     pub fn CreateResult(comptime T: type) type {
@@ -705,6 +707,15 @@ pub const GameState = struct {
             entity_ptr: *Entity,
             entity_handle: EntityHandle,
             handle: Set(T).Handle,
+
+            pub fn init(entity: anytype, entity_subtype: anytype) @This() {
+                return .{
+                    .ptr = entity_subtype.ptr,
+                    .handle = entity_subtype.handle,
+                    .entity_handle = entity.handle,
+                    .entity_ptr = entity.ptr,
+                };
+            }
         };
     }
 
@@ -715,33 +726,13 @@ pub const GameState = struct {
         handle,
     };
 
-    // pub fn remove_entity(self: *Self, entity: *Entity) void {
-    //     const entity_index: usize = index_from_pointer(entity, self.entities.items) orelse std.debug.panic("Invalid pointer!", .{});
-    //     switch (entity.type) {
-    //         .cat => |cat| {
-    //             // self.cats.swapRemove()
-    //         },
-    //         .bomb => |bomb| bomb.as_entity = new_entity_ptr,
-    //         .wall => {},
-    //         .modifier_pickup => |modifier_pickup| modifier_pickup.as_entity = new_entity_ptr,
-    //     }
-    //     if (entity_index != self.entities.items.len) {
-    //         const swapped_entity: *Entity = slices.last_ptr(self.entities.items);
-    //         const new_entity_ptr: *Entity = &self.entities.items[entity_index];
-    //         switch (swapped_entity.type) {
-    //             .cat => |cat| cat.as_entity = new_entity_ptr,
-    //             .bomb => |bomb| bomb.as_entity = new_entity_ptr,
-    //             .wall => {},
-    //             .modifier_pickup => |modifier_pickup| modifier_pickup.as_entity = new_entity_ptr,
-    //         }
-    //     }
-    // }
-
     pub const CreateCatParams = struct {
         controlling_player: ?*Player,
         starting_health: Health,
         position: Position,
         color: rl.Color,
+        register_in_distance_map: bool,
+        temporary_allocator: Allocator,
     };
     pub fn create_cat(self: *Self, params: CreateCatParams) Allocator.Error!Set(Cat).Handle {
         return (try self.create_cat_all(params)).handle;
@@ -750,6 +741,18 @@ pub const GameState = struct {
         self: *Self,
         params: CreateCatParams,
     ) Allocator.Error!CreateResult(Cat) {
+        const distances_handle: ?DistanceMapHandle = blk: {
+            if (!params.register_in_distance_map) break :blk null;
+            try self.distances_to_players.append(self.gpa, try .init(
+                self.gpa,
+                as(u32, self.grid.width),
+                as(u32, self.grid.height),
+            ));
+            const distances_handle = as(DistanceMapHandle, self.distances_to_players.items.len - 1);
+            try self.recalculate_distances_from(params.temporary_allocator, params.position, distances_handle);
+            break :blk distances_handle;
+        };
+
         const entity_entry = try self.entities.add_with_pointer(self.gpa, .{
             .health = params.starting_health,
             .position = params.position,
@@ -760,6 +763,7 @@ pub const GameState = struct {
             .color = params.color,
             .controlling_player = params.controlling_player,
             .wanted_direction = null,
+            .distances_map_handle = distances_handle,
         });
         entity_entry.ptr.type = .{ .cat = cat_entry.handle };
         if (params.controlling_player) |controlling_player| {
@@ -772,6 +776,39 @@ pub const GameState = struct {
             .entity_ptr = entity_entry.ptr,
             .entity_handle = entity_entry.handle,
         };
+    }
+
+    pub const CreateEnemyParams = struct {
+        position: Position,
+        health: Health,
+        enemy_type: Enemy.Type,
+        melee_damage: Health,
+        interval_between_hits: Duration,
+        interval_between_movement: Duration,
+        current_time: Timestamp,
+    };
+    pub fn create_enemy(self: *Self, params: CreateEnemyParams) Allocator.Error!Set(Enemy).Handle {
+        return (try self.create_enemy_all(params)).handle;
+    }
+    pub fn create_enemy_all(self: *Self, params: CreateEnemyParams) Allocator.Error!CreateResult(Enemy) {
+        const entity = try self.entities.add_with_pointer(self.gpa, .{
+            .health = params.health,
+            .position = params.position,
+            .type = undefined,
+        });
+        const enemy = try self.enemies.add_with_pointer(self.gpa, .{
+            .entity = entity.handle,
+            .melee_damage = params.melee_damage,
+            .type = params.enemy_type,
+            .interval_between_hits = params.interval_between_hits,
+            .timer_until_next_possible_hit = params.current_time.timer_that_goes_off_in(params.interval_between_hits),
+
+            .interval_between_movement = params.interval_between_movement,
+            .timer_until_next_possible_movement = params.current_time.timer_that_goes_off_in(params.interval_between_movement),
+        });
+        entity.ptr.type = .{ .enemy = enemy.handle };
+        self.grid.at(params.position).append_assert_ok(entity.handle);
+        return .init(entity, enemy);
     }
 
     pub const CreateBombParams = struct {
@@ -872,6 +909,54 @@ pub const VisualEffect = struct {
 
 // }
 
+fn debug_check_entity(state: *GameState, entity: *Entity, entity_handle: EntityHandle) void {
+    assert(state.entities.get(entity_handle).? == entity);
+    switch (entity.type) {
+        .wall => {},
+        .modifier_pickup => |pickup_handle| {
+            const pickup = state.modifier_pickups.get(pickup_handle).?;
+            assert(eql(pickup.entity, entity_handle));
+        },
+        .cat => |cat_handle| {
+            const cat = state.cats.get(cat_handle).?;
+            assert(eql(cat.entity, entity_handle));
+        },
+        .bomb => |bomb_handle| {
+            const bomb = state.bombs.get(bomb_handle).?;
+            assert(eql(bomb.entity, entity_handle));
+        },
+        .enemy => |enemy_handle| {
+            const enemy = state.enemies.get(enemy_handle).?;
+            assert(eql(enemy.entity, entity_handle));
+        },
+    }
+}
+
+pub fn debug_assert_invariants(state: *GameState) void {
+    if (!DO_INVARIANT_ASSERTS) return;
+    var it_entity = state.entities.iterator();
+    while (it_entity.next()) |entry| {
+        const entity, const entity_handle = entry;
+        debug_check_entity(state, entity, entity_handle);
+    }
+
+    var it = state.grid.iterator();
+    while (it.next()) |entry| {
+        for (entry.tile.items) |handle| {
+            const entity = state.entities.get(handle).?;
+            assert(eql(entity.position, entry.position));
+            debug_check_entity(state, entity, handle);
+        }
+    }
+
+    for (state.grid.tiles) |tile| {
+        for (tile.items) |handle| {
+            const entity = state.entities.get(handle).?;
+            debug_check_entity(state, entity, handle);
+        }
+    }
+}
+
 pub fn main() anyerror!void {
     // Initialization
     //--------------------------------------------------------------------------------------
@@ -930,17 +1015,17 @@ pub fn main() anyerror!void {
         \\w   ww           www
         \\w          wwwww www
         \\w                  w
-        \\w  w    w          w
+        \\w  w    w       e  w
         \\w       w          w
-        \\w       w          w
+        \\w1      w          w
         \\w       w          w
         \\w     wwwwwwww     w
         \\w       w          w
         \\w       w          w
         \\w  w               w
         \\w        w    ww www
-        \\w             ww www
-        \\w             ww www
+        \\w             wwewww
+        \\w             wwewww
         \\w             ww www
         \\ww           www www
         \\ww               www
@@ -953,47 +1038,86 @@ pub fn main() anyerror!void {
         .bombs = try .init_with_capacity(round_arena.allocator(), 0),
         .cats = try .init_with_capacity(round_arena.allocator(), 0),
         .entities = try .init_with_capacity(round_arena.allocator(), 0),
+        .enemies = try .init_with_capacity(round_arena.allocator(), 0),
         .modifier_pickups = try .init_with_capacity(round_arena.allocator(), 0),
         .visual_effects = try .init_with_capacity(round_arena.allocator(), 0),
+        .distances_to_players = try .initCapacity(round_arena.allocator(), 0),
         .grid = grid,
         .random = prng.random(),
     };
+
+    var _players_buffer: [10]Player = undefined;
+    var players = ArrayList(Player).initBuffer(&_players_buffer);
+    players.appendAssumeCapacity(.{
+        .cat = .empty_handle,
+        .color = Color.red.brightness(0.8),
+        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
+        .bomb_creation_properties = Bomb.Properties{
+            .blast_radius_in_tiles = 2,
+            .damage = Health{ .points = 5 },
+            .starting_health = Health.indestructible,
+            .time_to_detonate = Duration.seconds(2),
+        },
+    });
 
     for (0..@intCast(grid.height)) |y| {
         for (0..@intCast(grid.width)) |x| {
             const width: usize = @intCast(grid.width);
             const map_index: usize = y * (width + 1) + x;
             const char = game_map[map_index];
-            std.debug.print("{c}", .{char});
-            if (char == 'w') {
-                _ = try state.create_wall_all(.{
-                    .position = .{ .x = as(i32, x), .y = as(i32, y) },
-                    .health = .indestructible,
-                });
+            const position = Position{ .x = as(i32, x), .y = as(i32, y) };
+            switch (char) {
+                ' ' => {},
+                'w' => {
+                    _ = try state.create_wall_all(.{
+                        .position = position,
+                        .health = .indestructible,
+                    });
+                },
+                '1'...'9' => {
+                    const player_index = char - '1';
+                    if (player_index >= players.items.len) {
+                        std.debug.print("Invalid player index: {c} at position: {f}. Maximum is: {d}\n", .{
+                            char, position, players.items.len,
+                        });
+                        return error.invalid_player_index;
+                    }
+                    const player = &players.items[player_index];
+                    if (state.cats.get(player.cat)) |cat| {
+                        const previous_position = state.entities.get(cat.entity).?.position;
+                        std.debug.print("Player {c} has the starting position defined a second time at: {f}. First time was: {f}.\n", .{
+                            char, position, previous_position,
+                        });
+                        return error.player_starting_position_defined_multiple_times;
+                    }
+                    const player_cat = try state.create_cat(.{
+                        .color = player.color,
+                        .controlling_player = &players.items[0],
+                        .position = .{ .x = 1, .y = 5 },
+                        .starting_health = Health{ .points = 15 },
+                        .register_in_distance_map = true,
+                        .temporary_allocator = frame_arena.allocator(),
+                    });
+                    player.cat = player_cat;
+                },
+                'e' => {
+                    _ = try state.create_enemy(.{
+                        .position = position,
+                        .enemy_type = .normal,
+                        .health = Health{ .points = 5 },
+                        .melee_damage = Health{ .points = 4 },
+                        .interval_between_hits = Duration.seconds(0.8),
+                        .interval_between_movement = Duration.seconds(1.1),
+                        .current_time = Timestamp{ .seconds_from_beginning = rl.getTime() },
+                    });
+                },
+                else => {
+                    std.debug.print("Invalid character '{c}' at position: {f}\n", .{ char, position });
+                    return error.invalid_character;
+                },
             }
         }
-        std.debug.print("\n", .{});
     }
-
-    var _players_buffer: [10]Player = undefined;
-    var players = ArrayList(Player).initBuffer(&_players_buffer);
-    players.appendAssumeCapacity(.{
-        .cat = .empty_handle,
-        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
-        .bomb_creation_properties = Bomb.Properties{
-            .blast_radius_in_tiles = 2,
-            .damage = Health{ .points = 5 },
-            .starting_health = Health.indestructible,
-            .time_to_detonate = Duration.seconds(4),
-        },
-    });
-    const player_cat = try state.create_cat(.{
-        .color = Color.red.brightness(0.8),
-        .controlling_player = &players.items[0],
-        .position = .{ .x = 1, .y = 5 },
-        .starting_health = Health{ .points = 15 },
-    });
-    players.items[0].cat = player_cat;
 
     rl.setTargetFPS(60);
     //--------------------------------------------------------------------------------------
@@ -1009,6 +1133,9 @@ pub fn main() anyerror!void {
         //----------------------------------------------------------------------------------
         if (rl.isKeyPressed(.p)) {
             pause = !pause;
+        }
+        if (rl.isKeyPressed(.f3)) {
+            DEBUG = !DEBUG;
         }
 
         thicness += rl.getMouseWheelMove() / 100;
@@ -1058,6 +1185,49 @@ pub fn main() anyerror!void {
                 }
                 if (!eql(original_position, final_position)) {
                     state.move_assert_ok(cat.entity, final_position);
+                    if (cat.distances_map_handle) |map_handle| {
+                        state.recalculate_distances_from(frame_arena.allocator(), final_position, map_handle) catch |err| {
+                            comptime assert(@TypeOf(err) == Allocator.Error);
+                            std.log.warn("Out of memory when recalculating cat distances from: {f}. Cat handle: {any}", .{ final_position, entry.@"1" });
+                        };
+                    }
+                }
+            }
+
+            // Update enemies
+            var it_enemies = state.enemies.iterator();
+            enemies: while (it_enemies.next()) |entry| {
+                const enemy, const enemy_handle = entry;
+                _ = enemy_handle;
+                const entity: *Entity = state.entities.get(enemy.entity).?;
+
+                switch (enemy.type) {
+                    .normal => {
+                        if (!enemy.can_do_action(current_time)) continue :enemies;
+                        var best_position: ?Position = null;
+                        var best_distance = DistanceMap.infinity;
+                        for (&[_]Direction{ .up, .left, .down, .right }) |direction| {
+                            const position = entity.position.add(direction);
+                            var min_distance = DistanceMap.infinity;
+                            for (state.distances_to_players.items) |*distance_map| {
+                                min_distance = @min(min_distance, distance_map.distance_at(position));
+                            }
+                            if (min_distance < best_distance) {
+                                best_distance = min_distance;
+                                best_position = position;
+                            }
+                        }
+                        const pos = best_position orelse continue :enemies;
+                        if (best_distance == 0) {
+                            if (!enemy.can_hit(current_time)) continue :enemies;
+                            enemy.timer_until_next_possible_hit = current_time.timer_that_goes_off_in(enemy.interval_between_hits);
+                            _ = state.deal_damage_at(pos, enemy.melee_damage, enemy.entity);
+                        } else if (state.is_passable_at(pos)) {
+                            if (!enemy.can_move(current_time)) continue :enemies;
+                            enemy.timer_until_next_possible_movement = current_time.timer_that_goes_off_in(enemy.interval_between_movement);
+                            state.move_assert_ok(enemy.entity, pos);
+                        }
+                    },
                 }
             }
 
@@ -1151,6 +1321,12 @@ pub fn main() anyerror!void {
                         const cat = state.get(cat_handle).?;
                         rl.drawTexture(cat_texture, x_int, y_int, cat.color);
                     },
+                    .enemy => |enemy_handle| {
+                        const enemy = state.get(enemy_handle).?;
+                        _ = enemy;
+                        // TODO: use a custom texture for enemies
+                        rl.drawTexture(cat_texture, x_int, y_int, .red);
+                    },
                     .wall => {
                         rl.drawRectangle(
                             x_int,
@@ -1171,6 +1347,24 @@ pub fn main() anyerror!void {
             }
 
             if (DEBUG) {
+                const distance = state.distances_to_players.items[0].distance_at(item.position);
+                if (distance == DistanceMap.infinity) {
+                    rl.drawText(
+                        "no",
+                        @intFromFloat(coords.x + 9),
+                        @intFromFloat(coords.y + 14),
+                        10,
+                        .red,
+                    );
+                } else {
+                    rl.drawText(
+                        std.fmt.allocPrintSentinel(frame_arena.allocator(), "{d}", .{distance}, 0) catch unreachable,
+                        @intFromFloat(coords.x + 12),
+                        @intFromFloat(coords.y + 14),
+                        10,
+                        .red,
+                    );
+                }
                 rl.drawText(
                     std.fmt.allocPrintSentinel(frame_arena.allocator(), "{d},{d}", .{ item.position.x, item.position.y }, 0) catch unreachable,
                     @intFromFloat(coords.x),
@@ -1185,12 +1379,6 @@ pub fn main() anyerror!void {
         while (it_visual_effects.next()) |entry| {
             const visual_effect, const visual_effect_handle = entry;
             if (visual_effect.timer_till_disappear) |timer| if (timer.finished(current_time)) {
-                // for (state.visual_effects.entries.items, 0..) |e, i| {
-                //     switch (e) {
-                //         .free => std.debug.print(" [index={d} free]", .{i}),
-                //         .occupied => |o| std.debug.print(" [index={d} gen={d}]", .{ i, o.generation.n }),
-                //     }
-                // }
                 assert(state.visual_effects.remove(visual_effect_handle) != null);
                 continue;
             };
@@ -1232,4 +1420,8 @@ pub fn main() anyerror!void {
         rl.drawFPS(10, 10);
         //----------------------------------------------------------------------------------
     }
+}
+
+test {
+    _ = @import("set.zig");
 }
