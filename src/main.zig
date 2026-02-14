@@ -905,11 +905,18 @@ pub const VisualEffect = struct {
     };
 };
 
-// pub fn rectangle_from_corners(pos1: Position, pos2: Position)
+pub fn draw_progress_bar(area: rl.Rectangle, color: rl.Color, progress_0_1: f32) void {
+    const margin = 2;
 
-// pub fn draw_progress_bar(coords: Vector2, progress: f32) void {
-
-// }
+    rl.drawRectangleRec(area, rl.Color.dark_gray.brightness(-0.4));
+    var inner_rec = area;
+    inner_rec.width -= margin;
+    inner_rec.width *= progress_0_1;
+    inner_rec.height -= 2 * margin;
+    inner_rec.x += margin;
+    inner_rec.y += margin;
+    rl.drawRectangleRec(inner_rec, color);
+}
 
 fn debug_check_entity(state: *GameState, entity: *Entity, entity_handle: EntityHandle) void {
     assert(state.entities.get(entity_handle).? == entity);
@@ -1052,7 +1059,18 @@ pub fn main() anyerror!void {
     var players = ArrayList(Player).initBuffer(&_players_buffer);
     players.appendAssumeCapacity(.{
         .cat = .empty_handle,
-        .color = Color.red.brightness(0.8),
+        .color = Color.green.brightness(0.8),
+        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
+        .bomb_creation_properties = Bomb.Properties{
+            .blast_radius_in_tiles = 2,
+            .damage = Health{ .points = 5 },
+            .starting_health = Health.indestructible,
+            .time_to_detonate = Duration.seconds(2),
+        },
+    });
+    players.appendAssumeCapacity(.{
+        .cat = .empty_handle,
+        .color = Color.blue.brightness(0.8),
         .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
         .bomb_creation_properties = Bomb.Properties{
             .blast_radius_in_tiles = 2,
@@ -1094,8 +1112,8 @@ pub fn main() anyerror!void {
                     }
                     const player_cat = try state.create_cat(.{
                         .color = player.color,
-                        .controlling_player = &players.items[0],
-                        .position = .{ .x = 1, .y = 5 },
+                        .controlling_player = &players.items[player_index],
+                        .position = position,
                         .starting_health = Health{ .points = 15 },
                         .register_in_distance_map = true,
                         .temporary_allocator = frame_arena.allocator(),
@@ -1338,7 +1356,10 @@ pub fn main() anyerror!void {
                 },
                 .after_dash => |after_dash| {
                     const start_color = rl.Color.white.alpha(0);
-                    const end_color = after_dash.color.brightness(-0.3).alpha(1 - visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time));
+                    var color_hsv = after_dash.color.brightness(-0.3).toHSV();
+                    color_hsv.y = std.math.sqrt(std.math.sqrt(color_hsv.y));
+                    const main_color = rl.Color.fromHSV(color_hsv.x, color_hsv.y, color_hsv.z);
+                    const end_color = main_color.alpha(1 - visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time));
                     // const end_color = after_dash.color;
                     const start_pos = visual_effect.position;
                     const end_pos = after_dash.end_position;
@@ -1448,8 +1469,15 @@ pub fn main() anyerror!void {
                             rl.Color.dark_blue.contrast(-0.6),
                         );
                     },
-                    .bomb => {
-                        rl.drawTexture(bomb_texture, x_int, y_int, .white);
+                    .bomb => |bomb_handle| {
+                        const bomb = state.bombs.get(bomb_handle).?;
+                        const progress = bomb.timer_till_explosion.progress_from_0_to_1(current_time);
+
+                        rl.drawTexture(bomb_texture, x_int, y_int, rl.colorLerp(
+                            .white,
+                            rl.Color.red.brightness(0.3),
+                            progress,
+                        ));
                     },
                     .modifier_pickup => |pickup_handle| {
                         const pickup = state.get(pickup_handle).?;
