@@ -804,7 +804,7 @@ pub const GameState = struct {
             .timer_until_next_possible_hit = params.current_time.timer_that_goes_off_in(params.interval_between_hits),
 
             .interval_between_movement = params.interval_between_movement,
-            .timer_until_next_possible_movement = params.current_time.timer_that_goes_off_in(params.interval_between_movement),
+            .timer_until_next_possible_movement = params.current_time.plus_duration(.seconds(self.random.float(f32) * 0.4)).timer_that_goes_off_in(params.interval_between_movement),
         });
         entity.ptr.type = .{ .enemy = enemy.handle };
         self.grid.at(params.position).append_assert_ok(entity.handle);
@@ -1031,7 +1031,7 @@ pub fn main() anyerror!void {
         \\w     wwwwwwww     w
         \\w       w          w
         \\w       w          w
-        \\w  w               w
+        \\w  w              2w
         \\w        w    ww www
         \\w             wwewww
         \\w             wwewww
