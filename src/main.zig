@@ -894,7 +894,7 @@ pub const VisualEffect = struct {
     position: Position,
     type: Type,
     pub const Type = union(enum) {
-        after_dash: struct { intensity_percentile: i8 = 100 },
+        after_dash: struct { color: Color, end_position: Position, direction: Direction },
         fire,
 
         const Self = @This();
@@ -904,6 +904,8 @@ pub const VisualEffect = struct {
         }
     };
 };
+
+// pub fn rectangle_from_corners(pos1: Position, pos2: Position)
 
 // pub fn draw_progress_bar(coords: Vector2, progress: f32) void {
 
@@ -1184,6 +1186,11 @@ pub fn main() anyerror!void {
                     final_position = next_position;
                 }
                 if (!eql(original_position, final_position)) {
+                    _ = try state.create_visual_effect(.{
+                        .position = original_position,
+                        .timer_till_disappear = current_time.timer_that_goes_off_in(.seconds(0.3)),
+                        .type = .{ .after_dash = .{ .color = cat.color, .end_position = final_position, .direction = wanted_direction } },
+                    });
                     state.move_assert_ok(cat.entity, final_position);
                     if (cat.distances_map_handle) |map_handle| {
                         state.recalculate_distances_from(frame_arena.allocator(), final_position, map_handle) catch |err| {
@@ -1291,6 +1298,7 @@ pub fn main() anyerror!void {
 
         rl.clearBackground(.init(242, 242, 242, 255));
 
+        const tile_size_on_screen = game_view.scale_to_screen(1) * 1.02;
         const lines_color = rl.Color.white;
         const line_thickness = game_view.scale_to_screen(thicness);
         {
@@ -1308,7 +1316,111 @@ pub fn main() anyerror!void {
             }
         }
 
-        const tile_size_on_screen = game_view.scale_to_screen(1) * 1.02;
+        var it_visual_effects = state.visual_effects.iterator();
+        while (it_visual_effects.next()) |entry| {
+            const visual_effect, const visual_effect_handle = entry;
+            if (visual_effect.timer_till_disappear) |timer| if (timer.finished(current_time)) {
+                assert(state.visual_effects.remove(visual_effect_handle) != null);
+                continue;
+            };
+
+            const coords = game_view.screen_coordinates_from_position(visual_effect.position);
+            // const x_int = as(i32, coords.x);
+            // const y_int = as(i32, coords.y);
+
+            switch (visual_effect.type) {
+                .fire => {
+                    // const progress = visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time);
+                    // const scale = cap_0_1(std.math.pow(f32, 1 - progress, 2));
+                    const scale = 1;
+                    const rotation = state.random.float(f32) * 2 * pi;
+                    rl.drawTextureEx(fire_texture, coords, rotation, scale, .white);
+                },
+                .after_dash => |after_dash| {
+                    const start_color = rl.Color.white.alpha(0);
+                    const end_color = after_dash.color.brightness(-0.3).alpha(1 - visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time));
+                    // const end_color = after_dash.color;
+                    const start_pos = visual_effect.position;
+                    const end_pos = after_dash.end_position;
+                    const width = game_view.scale_to_screen(as(f32, @abs(start_pos.x - end_pos.x) + 1));
+                    const height = game_view.scale_to_screen(as(f32, @abs(start_pos.y - end_pos.y) + 1));
+
+                    switch (after_dash.direction) {
+                        .down => {
+                            rl.drawRectangleGradientEx(
+                                .{
+                                    .x = coords.x,
+                                    .y = coords.y,
+                                    .height = height,
+                                    .width = width,
+                                },
+                                start_color,
+                                end_color,
+                                end_color,
+                                start_color,
+                            );
+                        },
+                        .up => {
+                            rl.drawRectangleGradientEx(
+                                .{
+                                    .x = coords.x - width + tile_size_on_screen,
+                                    .y = coords.y - height + tile_size_on_screen,
+                                    .height = height,
+                                    .width = width,
+                                },
+                                end_color,
+                                start_color,
+                                start_color,
+                                end_color,
+                            );
+                        },
+                        .left => {
+                            rl.drawRectangleGradientEx(
+                                .{
+                                    .x = coords.x - width + tile_size_on_screen,
+                                    .y = coords.y - height + tile_size_on_screen,
+                                    .height = height,
+                                    .width = width,
+                                },
+                                end_color,
+                                end_color,
+                                start_color,
+                                start_color,
+                            );
+                        },
+                        .right => {
+                            rl.drawRectangleGradientEx(
+                                .{
+                                    .x = coords.x,
+                                    .y = coords.y,
+                                    .height = height,
+                                    .width = width,
+                                },
+                                start_color,
+                                start_color,
+                                end_color,
+                                end_color,
+                            );
+                        },
+                    }
+                    // rl.drawRectangleGradientEx()
+                    // if (is_horizontal) {
+                    //     const height = tile_size_on_screen;
+                    //     const width = game_view.scale_to_screen(as(f32, after_dash.end_position.x - visual_effect.position.x + 1));
+                    //     const is_left = visual_effect.position.x < after_dash.end_position.x;
+                    //     rl.drawRectangleGradientH(
+                    //         x_int,
+                    //         y_int,
+                    //         as(i32, width),
+                    //         as(i32, height),
+                    //         if (is_left) start_color else end_color,
+                    //         if (!is_left) start_color else end_color,
+                    //     );
+                    // }
+                },
+            }
+        }
+
         var tiles_iterator = grid.iterator();
         while (tiles_iterator.next()) |item| {
             const coords = game_view.screen_coordinates_from_position(item.position);
@@ -1372,33 +1484,6 @@ pub fn main() anyerror!void {
                     10,
                     .red,
                 );
-            }
-        }
-
-        var it_visual_effects = state.visual_effects.iterator();
-        while (it_visual_effects.next()) |entry| {
-            const visual_effect, const visual_effect_handle = entry;
-            if (visual_effect.timer_till_disappear) |timer| if (timer.finished(current_time)) {
-                assert(state.visual_effects.remove(visual_effect_handle) != null);
-                continue;
-            };
-
-            const coords = game_view.screen_coordinates_from_position(visual_effect.position);
-            // const x_int = as(i32, coords.x);
-            // const y_int = as(i32, coords.y);
-
-            switch (visual_effect.type) {
-                .fire => {
-                    // const progress = visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time);
-                    // const scale = cap_0_1(std.math.pow(f32, 1 - progress, 2));
-                    const scale = 1;
-                    const rotation = state.random.float(f32) * 2 * pi;
-                    rl.drawTextureEx(fire_texture, coords, rotation, scale, .white);
-                },
-                .after_dash => |after_dash| {
-                    _ = after_dash;
-                    //
-                },
             }
         }
 
