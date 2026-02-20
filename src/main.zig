@@ -1031,7 +1031,7 @@ pub fn main() anyerror!void {
         \\w     wwwwwwww     w
         \\w       w          w
         \\w       w          w
-        \\w  w              2w
+        \\w  w               w
         \\w        w    ww www
         \\w             wwewww
         \\w             wwewww
@@ -1071,6 +1071,17 @@ pub fn main() anyerror!void {
     players.appendAssumeCapacity(.{
         .cat = .empty_handle,
         .color = Color.blue.brightness(0.8),
+        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
+        .bomb_creation_properties = Bomb.Properties{
+            .blast_radius_in_tiles = 2,
+            .damage = Health{ .points = 5 },
+            .starting_health = Health.indestructible,
+            .time_to_detonate = Duration.seconds(2),
+        },
+    });
+    players.appendAssumeCapacity(.{
+        .cat = .empty_handle,
+        .color = Color.red.brightness(0.8),
         .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
         .bomb_creation_properties = Bomb.Properties{
             .blast_radius_in_tiles = 2,
@@ -1270,7 +1281,7 @@ pub fn main() anyerror!void {
                 const base_effect_timer = current_time.timer_that_goes_off_in(.seconds(0.3));
                 _ = try state.create_visual_effect(VisualEffect{
                     .position = bomb_entity.position,
-                    .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.1)),
+                    .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
                     .type = .fire,
                 });
 
@@ -1288,7 +1299,7 @@ pub fn main() anyerror!void {
                         }
                         _ = try state.create_visual_effect(VisualEffect{
                             .position = position,
-                            .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.1)),
+                            .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
                             .type = .fire,
                         });
                     }
