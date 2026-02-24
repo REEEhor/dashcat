@@ -544,6 +544,58 @@ pub const GameView = struct {
 
 pub const EntityHandle = Set(Entity).Handle;
 
+pub fn update_bombs(state: *GameState, current_time: Timestamp) !void {
+    var it_bombs = state.bombs.iterator();
+    while (it_bombs.next()) |entry| {
+        const bomb_ptr, _ = entry;
+        if (!bomb_ptr.timer_till_explosion.finished(current_time)) continue;
+        const bomb = bomb_ptr; // Copy the bomb
+        const bomb_entity: *Entity = state.get(bomb.entity).?;
+
+        var starting_damage = bomb.damage;
+        _ = starting_damage.sub_mut(state.deal_damage_at(bomb_entity.position, bomb.damage, bomb.entity).damage_dealt);
+
+        const base_effect_timer = current_time.timer_that_goes_off_in(.seconds(0.3));
+        _ = try state.create_visual_effect(VisualEffect{
+            .position = bomb_entity.position,
+            .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
+            .type = .fire,
+        });
+
+        directions: for (&[_]Direction{ .up, .left, .down, .right }) |direction| {
+            var position = bomb_entity.position;
+            var damage_to_deal = starting_damage;
+            for (0..as(usize, bomb.blast_radius_in_tiles)) |_| {
+                if (damage_to_deal.is_zero()) continue :directions;
+                position = position.add(direction);
+                const damage_dealt = state.deal_damage_at(position, bomb.damage, .empty_handle).damage_dealt;
+                _ = damage_to_deal.sub_mut(damage_dealt);
+                for (state.grid.at(position).items) |handle| {
+                    const entity = state.entities.get(handle).?;
+                    if (entity.type.tag() == .wall or entity.type.tag() == .bomb) continue :directions;
+                }
+                _ = try state.create_visual_effect(VisualEffect{
+                    .position = position,
+                    .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
+                    .type = .fire,
+                });
+            }
+        }
+
+        _ = state.remove_entity(bomb.entity);
+        try state.recalculate_all_distances();
+    }
+}
+
+pub fn update_effect_pickups(state: *GameState, current_time: Timestamp) !void {
+    var it_modifier_pickups = state.modifier_pickups.iterator();
+    while (it_modifier_pickups.next()) |entry| {
+        const modifier_pickup, _ = entry;
+        if (!modifier_pickup.timer_till_disappear.finished(current_time)) continue;
+        assert(state.remove_entity(modifier_pickup.entity).removal_sucessful);
+    }
+}
+
 //                    0 1 2 3 4 5
 // (idx) item_idx:    2 4 5 1 3 0
 // (idx) handle_idx:  5 3 0 4 1 2
@@ -559,12 +611,16 @@ pub const EntityHandle = Set(Entity).Handle;
 
 pub const GameState = struct {
     gpa: Allocator,
+    frame_arena: *ArenaAllocator,
 
+    // Entities
     entities: Set(Entity),
     cats: Set(Cat),
     enemies: Set(Enemy),
     bombs: Set(Bomb),
     modifier_pickups: Set(ModifierPickup),
+
+    players: std.ArrayList(Player),
 
     distances_to_players: std.ArrayList(DistanceMap),
 
@@ -669,22 +725,33 @@ pub const GameState = struct {
         self.grid.at(new_position).append_assert_ok(entity_handle);
     }
 
+    pub fn recalculate_all_distances(self: *Self) Allocator.Error!void {
+        var it = self.cats.iterator();
+        while (it.next()) |entry| {
+            const cat, _ = entry;
+            const position = self.get(cat.entity).?.position;
+            const distances_handle = cat.distances_map_handle orelse continue;
+            try self.recalculate_distances_from(position, distances_handle);
+        }
+    }
+
     pub fn recalculate_distances_from(
         self: *Self,
-        temporary_allocator: Allocator,
         start: Position,
         distances_handle: DistanceMapHandle,
     ) Allocator.Error!void {
+        const gpa = self.frame_arena.allocator();
+
         // Do a BFS
         const distance_map = &self.distances_to_players.items[distances_handle.index];
         distance_map.set_all_to_infinity();
 
         const not_visited = DistanceMap.infinity;
 
-        var to_visit = try Deque(Position).initCapacity(temporary_allocator, 10);
-        defer to_visit.deinit(temporary_allocator);
+        var to_visit = try Deque(Position).initCapacity(gpa, 10);
+        defer to_visit.deinit(gpa);
 
-        try to_visit.pushBack(temporary_allocator, start);
+        try to_visit.pushBack(gpa, start);
         distance_map.distance_at_ptr(start).* = 0;
 
         while (to_visit.popFront()) |current_position| {
@@ -696,7 +763,7 @@ pub const GameState = struct {
                 if (distance_map.distance_at(neighbour_position) != not_visited) continue;
                 if (!self.is_passable_at(neighbour_position)) continue;
                 distance_map.distance_at_ptr(neighbour_position).* = current_distance + 1;
-                try to_visit.pushBack(temporary_allocator, neighbour_position);
+                try to_visit.pushBack(gpa, neighbour_position);
             }
         }
     }
@@ -732,7 +799,6 @@ pub const GameState = struct {
         position: Position,
         color: rl.Color,
         register_in_distance_map: bool,
-        temporary_allocator: Allocator,
     };
     pub fn create_cat(self: *Self, params: CreateCatParams) Allocator.Error!Set(Cat).Handle {
         return (try self.create_cat_all(params)).handle;
@@ -749,7 +815,7 @@ pub const GameState = struct {
                 as(u32, self.grid.height),
             ));
             const distances_handle = as(DistanceMapHandle, self.distances_to_players.items.len - 1);
-            try self.recalculate_distances_from(params.temporary_allocator, params.position, distances_handle);
+            try self.recalculate_distances_from(params.position, distances_handle);
             break :blk distances_handle;
         };
 
@@ -941,6 +1007,237 @@ fn debug_check_entity(state: *GameState, entity: *Entity, entity_handle: EntityH
     }
 }
 
+pub fn render(
+    state: *GameState,
+    game_view: *GameView,
+    assets: Assets,
+    current_time: Timestamp,
+    pause: bool,
+    pause_frames_counter: usize,
+) void {
+    rl.beginDrawing();
+    defer rl.endDrawing();
+
+    rl.clearBackground(.init(242, 242, 242, 255));
+
+    const tile_size_on_screen = game_view.scale_to_screen(1) * 1.02;
+    const lines_color = rl.Color.white;
+    const line_thickness = game_view.scale_to_screen(0.1);
+    {
+        // Draw horizontal tiles
+        for (0..@intCast(state.grid.height + 1)) |y_in_game| {
+            var start = game_view.screen_coordinates_from_position(.{ .x = 0, .y = @intCast(y_in_game) });
+            start = start.add(.{ .x = 0, .y = -line_thickness / 2 });
+            rl.drawRectangleV(start, .{ .x = game_view.on_screen.x_span(), .y = line_thickness }, lines_color);
+        }
+        // Draw vertical tiles
+        for (0..@intCast(state.grid.width + 1)) |x_in_game| {
+            var start = game_view.screen_coordinates_from_position(.{ .x = @intCast(x_in_game), .y = 0 });
+            start = start.add(.{ .x = -line_thickness / 2, .y = 0 });
+            rl.drawRectangleV(start, .{ .x = line_thickness, .y = game_view.on_screen.y_span() }, lines_color);
+        }
+    }
+
+    var it_visual_effects = state.visual_effects.iterator();
+    while (it_visual_effects.next()) |entry| {
+        const visual_effect, const visual_effect_handle = entry;
+        if (visual_effect.timer_till_disappear) |timer| if (timer.finished(current_time)) {
+            assert(state.visual_effects.remove(visual_effect_handle) != null);
+            continue;
+        };
+
+        const coords = game_view.screen_coordinates_from_position(visual_effect.position);
+        // const x_int = as(i32, coords.x);
+        // const y_int = as(i32, coords.y);
+
+        switch (visual_effect.type) {
+            .fire => {
+                // const progress = visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time);
+                // const scale = cap_0_1(std.math.pow(f32, 1 - progress, 2));
+                const scale = 1;
+                const rotation = state.random.float(f32) * 2 * pi;
+                rl.drawTextureEx(assets.fire_texture, coords, rotation, scale, .white);
+            },
+            .after_dash => |after_dash| {
+                const start_color = rl.Color.white.alpha(0);
+                var color_hsv = after_dash.color.brightness(-0.3).toHSV();
+                color_hsv.y = std.math.sqrt(std.math.sqrt(color_hsv.y));
+                const main_color = rl.Color.fromHSV(color_hsv.x, color_hsv.y, color_hsv.z);
+                const end_color = main_color.alpha(1 - visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time));
+                // const end_color = after_dash.color;
+                const start_pos = visual_effect.position;
+                const end_pos = after_dash.end_position;
+                const width = game_view.scale_to_screen(as(f32, @abs(start_pos.x - end_pos.x) + 1));
+                const height = game_view.scale_to_screen(as(f32, @abs(start_pos.y - end_pos.y) + 1));
+
+                switch (after_dash.direction) {
+                    .down => {
+                        rl.drawRectangleGradientEx(
+                            .{
+                                .x = coords.x,
+                                .y = coords.y,
+                                .height = height,
+                                .width = width,
+                            },
+                            start_color,
+                            end_color,
+                            end_color,
+                            start_color,
+                        );
+                    },
+                    .up => {
+                        rl.drawRectangleGradientEx(
+                            .{
+                                .x = coords.x - width + tile_size_on_screen,
+                                .y = coords.y - height + tile_size_on_screen,
+                                .height = height,
+                                .width = width,
+                            },
+                            end_color,
+                            start_color,
+                            start_color,
+                            end_color,
+                        );
+                    },
+                    .left => {
+                        rl.drawRectangleGradientEx(
+                            .{
+                                .x = coords.x - width + tile_size_on_screen,
+                                .y = coords.y - height + tile_size_on_screen,
+                                .height = height,
+                                .width = width,
+                            },
+                            end_color,
+                            end_color,
+                            start_color,
+                            start_color,
+                        );
+                    },
+                    .right => {
+                        rl.drawRectangleGradientEx(
+                            .{
+                                .x = coords.x,
+                                .y = coords.y,
+                                .height = height,
+                                .width = width,
+                            },
+                            start_color,
+                            start_color,
+                            end_color,
+                            end_color,
+                        );
+                    },
+                }
+                // rl.drawRectangleGradientEx()
+                // if (is_horizontal) {
+                //     const height = tile_size_on_screen;
+                //     const width = game_view.scale_to_screen(as(f32, after_dash.end_position.x - visual_effect.position.x + 1));
+                //     const is_left = visual_effect.position.x < after_dash.end_position.x;
+                //     rl.drawRectangleGradientH(
+                //         x_int,
+                //         y_int,
+                //         as(i32, width),
+                //         as(i32, height),
+                //         if (is_left) start_color else end_color,
+                //         if (!is_left) start_color else end_color,
+                //     );
+                // }
+            },
+        }
+    }
+
+    var tiles_iterator = state.grid.iterator();
+    while (tiles_iterator.next()) |item| {
+        const coords = game_view.screen_coordinates_from_position(item.position);
+        const x_int = as(i32, coords.x);
+        const y_int = as(i32, coords.y);
+        for (item.tile.items) |handle| {
+            const entity: *Entity = state.get(handle).?;
+            switch (entity.type) {
+                .cat => |cat_handle| {
+                    const cat = state.get(cat_handle).?;
+                    rl.drawTexture(assets.cat_texture, x_int, y_int, cat.color);
+                },
+                .enemy => |enemy_handle| {
+                    const enemy = state.get(enemy_handle).?;
+                    _ = enemy;
+                    // TODO: use a custom texture for enemies
+                    rl.drawTexture(assets.cat_texture, x_int, y_int, .red);
+                },
+                .wall => {
+                    rl.drawRectangle(
+                        x_int,
+                        y_int,
+                        as(i32, tile_size_on_screen),
+                        as(i32, tile_size_on_screen),
+                        rl.Color.dark_blue.contrast(-0.6),
+                    );
+                },
+                .bomb => |bomb_handle| {
+                    const bomb = state.bombs.get(bomb_handle).?;
+                    const progress = bomb.timer_till_explosion.progress_from_0_to_1(current_time);
+
+                    rl.drawTexture(assets.bomb_texture, x_int, y_int, rl.colorLerp(
+                        .white,
+                        rl.Color.red.brightness(0.3),
+                        progress,
+                    ));
+                },
+                .modifier_pickup => |pickup_handle| {
+                    const pickup = state.get(pickup_handle).?;
+                    rl.drawTexture(pickup.texture, x_int, y_int, .white);
+                },
+            }
+        }
+
+        if (DEBUG) {
+            const distance = state.distances_to_players.items[0].distance_at(item.position);
+            if (distance == DistanceMap.infinity) {
+                rl.drawText(
+                    "no",
+                    @intFromFloat(coords.x + 9),
+                    @intFromFloat(coords.y + 14),
+                    10,
+                    .red,
+                );
+            } else {
+                rl.drawText(
+                    std.fmt.allocPrintSentinel(state.frame_arena.allocator(), "{d}", .{distance}, 0) catch unreachable,
+                    @intFromFloat(coords.x + 12),
+                    @intFromFloat(coords.y + 14),
+                    10,
+                    .red,
+                );
+            }
+            rl.drawText(
+                std.fmt.allocPrintSentinel(state.frame_arena.allocator(), "{d},{d}", .{ item.position.x, item.position.y }, 0) catch unreachable,
+                @intFromFloat(coords.x),
+                @intFromFloat(coords.y),
+                10,
+                .red,
+            );
+        }
+    }
+
+    rl.drawText(
+        std.fmt.allocPrintSentinel(state.frame_arena.allocator(), "Health: {d}", .{
+            if (state.cats.get(state.players.items[0].cat)) |c| state.entities.get(c.entity).?.health.?.points else -1,
+        }, 0) catch unreachable,
+        120,
+        10,
+        20,
+        rl.Color.green,
+    );
+
+    // On pause, we draw a blinking message
+    if (pause and @mod(@divFloor(pause_frames_counter, 30), 2) == 0) {
+        rl.drawText("PAUSED", 350, 200, 30, .gray);
+    }
+
+    rl.drawFPS(10, 10);
+    //----------------------------------------------------------------------------------
+}
+
 pub fn debug_assert_invariants(state: *GameState) void {
     if (!DO_INVARIANT_ASSERTS) return;
     var it_entity = state.entities.iterator();
@@ -948,7 +1245,6 @@ pub fn debug_assert_invariants(state: *GameState) void {
         const entity, const entity_handle = entry;
         debug_check_entity(state, entity, entity_handle);
     }
-
     var it = state.grid.iterator();
     while (it.next()) |entry| {
         for (entry.tile.items) |handle| {
@@ -957,11 +1253,150 @@ pub fn debug_assert_invariants(state: *GameState) void {
             debug_check_entity(state, entity, handle);
         }
     }
-
     for (state.grid.tiles) |tile| {
         for (tile.items) |handle| {
             const entity = state.entities.get(handle).?;
             debug_check_entity(state, entity, handle);
+        }
+    }
+}
+
+pub const Assets = struct {
+    cat_texture: rl.Texture,
+    fire_texture: rl.Texture,
+    bomb_texture: rl.Texture,
+};
+
+pub fn single_round_main_loop(state: *GameState, game_view: *GameView, assets: Assets) !void {
+    var pause = false;
+    var pause_frames_counter: usize = 0;
+
+    while (true) {
+        if (rl.windowShouldClose()) return;
+        const current_time = Timestamp{ .seconds_from_beginning = rl.getTime() };
+        defer std.debug.assert(state.frame_arena.reset(.retain_capacity));
+
+        // Update
+        //----------------------------------------------------------------------------------
+        if (rl.isKeyPressed(.p)) {
+            pause = !pause;
+        }
+        if (rl.isKeyPressed(.f3)) {
+            DEBUG = !DEBUG;
+        }
+
+        if (!pause) {
+            try update_players(state, current_time);
+            try update_cats(state, current_time);
+            try update_enemies(state, current_time);
+            try update_bombs(state, current_time);
+            try update_effect_pickups(state, current_time);
+        } else {
+            pause_frames_counter += 1;
+        }
+        //----------------------------------------------------------------------------------
+
+        // Draw
+        //----------------------------------------------------------------------------------
+        render(state, game_view, assets, current_time, pause, pause_frames_counter);
+    }
+}
+
+pub fn update_enemies(state: *GameState, current_time: Timestamp) !void {
+    var it_enemies = state.enemies.iterator();
+    enemies: while (it_enemies.next()) |entry| {
+        const enemy, const enemy_handle = entry;
+        _ = enemy_handle;
+        const entity: *Entity = state.entities.get(enemy.entity).?;
+
+        switch (enemy.type) {
+            .normal => {
+                if (!enemy.can_do_action(current_time)) continue :enemies;
+                var best_position: ?Position = null;
+                var best_distance = DistanceMap.infinity;
+                for (&[_]Direction{ .up, .left, .down, .right }) |direction| {
+                    const position = entity.position.add(direction);
+                    var min_distance = DistanceMap.infinity;
+                    for (state.distances_to_players.items) |*distance_map| {
+                        min_distance = @min(min_distance, distance_map.distance_at(position));
+                    }
+                    if (min_distance < best_distance) {
+                        best_distance = min_distance;
+                        best_position = position;
+                    }
+                }
+                const pos = best_position orelse continue :enemies;
+                if (best_distance == 0) {
+                    if (!enemy.can_hit(current_time)) continue :enemies;
+                    enemy.timer_until_next_possible_hit = current_time.timer_that_goes_off_in(enemy.interval_between_hits);
+                    _ = state.deal_damage_at(pos, enemy.melee_damage, enemy.entity);
+                } else if (state.is_passable_at(pos)) {
+                    if (!enemy.can_move(current_time)) continue :enemies;
+                    enemy.timer_until_next_possible_movement = current_time.timer_that_goes_off_in(enemy.interval_between_movement);
+                    state.move_assert_ok(enemy.entity, pos);
+                }
+            },
+        }
+    }
+}
+
+pub fn update_cats(state: *GameState, current_time: Timestamp) !void {
+    var it_cats = state.cats.iterator();
+    while (it_cats.next()) |entry| {
+        const cat, _ = entry;
+        const cat_entity: *Entity = state.get(cat.entity).?;
+        defer cat.wanted_direction = null;
+        const wanted_direction = cat.wanted_direction orelse continue;
+
+        const original_position = cat_entity.position;
+        var final_position = original_position;
+        search: while (true) {
+            const next_position = final_position.add(wanted_direction);
+            for (state.grid.at(next_position).items) |another_entity_handle| {
+                _ = another_entity_handle;
+                // FIXME: actually pickup the effect
+                // if (another_entity.type.tag() != .modifier_pickup) break;
+                break :search;
+            }
+            final_position = next_position;
+        }
+        if (!eql(original_position, final_position)) {
+            _ = try state.create_visual_effect(.{
+                .position = original_position,
+                .timer_till_disappear = current_time.timer_that_goes_off_in(.seconds(0.3)),
+                .type = .{ .after_dash = .{ .color = cat.color, .end_position = final_position, .direction = wanted_direction } },
+            });
+            state.move_assert_ok(cat.entity, final_position);
+            if (cat.distances_map_handle) |map_handle| {
+                state.recalculate_distances_from(final_position, map_handle) catch |err| {
+                    comptime assert(@TypeOf(err) == Allocator.Error);
+                    std.log.warn("Out of memory when recalculating cat distances from: {f}. Cat handle: {any}", .{ final_position, entry.@"1" });
+                };
+            }
+        }
+    }
+}
+
+pub fn update_players(state: *GameState, current_time: Timestamp) !void {
+    for (state.players.items) |*player| {
+        const cat = state.cats.get(player.cat) orelse continue;
+        const cat_position = state.get(cat.entity).?.position;
+        if (rl.isKeyPressed(player.controls.up)) cat.wanted_direction = .up;
+        if (rl.isKeyPressed(player.controls.left)) cat.wanted_direction = .left;
+        if (rl.isKeyPressed(player.controls.right)) cat.wanted_direction = .right;
+        if (rl.isKeyPressed(player.controls.down)) cat.wanted_direction = .down;
+        if (rl.isKeyPressed(player.controls.spawn_bomb)) {
+            const no_other_bomb = for (state.grid.at(cat_position).items) |entity| {
+                if (state.get(entity).?.type.tag() == .bomb) break false;
+            } else true;
+            if (no_other_bomb) {
+                _ = try state.create_bomb(.{
+                    .current_time = current_time,
+                    .position = cat_position,
+                    .properties = player.bomb_creation_properties,
+                });
+                try state.recalculate_all_distances();
+            }
         }
     }
 }
@@ -990,33 +1425,33 @@ pub fn main() anyerror!void {
     rl.initWindow(screen.width, screen.height, "Dash Cat");
     defer rl.closeWindow(); // Close window and OpenGL context
 
-    var pause: bool = false;
-    var framesCounter: i32 = 0;
-
-    var grid = try Grid.init(round_arena.allocator(), 20, 20, 20);
-    const game_view = GameView{
+    const grid = try Grid.init(round_arena.allocator(), 20, 20, 20);
+    var game_view = GameView{
         .in_game = .{ .min_x = 0, .min_y = 0, .max_x = @floatFromInt(grid.width), .max_y = @floatFromInt(grid.height) },
         .on_screen = .{ .min_x = 10, .min_y = 10, .max_x = 800 - 20, .max_y = 800 - 20 },
     };
 
-    const cat_texture = blk: {
-        var image = try rl.loadImage("assets/cat.png");
-        const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
-        image.resize(new_side_length, new_side_length);
-        break :blk try rl.Texture.fromImage(image);
+    const assets = Assets{
+        .cat_texture = blk: {
+            var image = try rl.loadImage("assets/cat.png");
+            const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
+            image.resize(new_side_length, new_side_length);
+            break :blk try rl.Texture.fromImage(image);
+        },
+        .bomb_texture = blk: {
+            var image = try rl.loadImage("assets/bomb.png");
+            const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
+            image.resize(new_side_length, new_side_length);
+            break :blk try rl.Texture.fromImage(image);
+        },
+        .fire_texture = blk: {
+            var image = try rl.loadImage("assets/fire1.png");
+            const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
+            image.resize(new_side_length, new_side_length);
+            break :blk try rl.Texture.fromImage(image);
+        },
     };
-    const bomb_texture = blk: {
-        var image = try rl.loadImage("assets/bomb.png");
-        const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
-        image.resize(new_side_length, new_side_length);
-        break :blk try rl.Texture.fromImage(image);
-    };
-    const fire_texture = blk: {
-        var image = try rl.loadImage("assets/fire1.png");
-        const new_side_length: i32 = @intFromFloat(game_view.scale_to_screen(1));
-        image.resize(new_side_length, new_side_length);
-        break :blk try rl.Texture.fromImage(image);
-    };
+
     const game_map =
         //01234567890123456789
         \\wwwwwwwwwwwwwwwwwwww
@@ -1041,6 +1476,8 @@ pub fn main() anyerror!void {
         \\wwwwwwwwwwwwwwwwwwww
     ;
 
+    var _players_buffer: [10]Player = undefined;
+
     var prng = std.Random.DefaultPrng.init(42);
     var state = GameState{
         .gpa = round_arena.allocator(),
@@ -1051,13 +1488,13 @@ pub fn main() anyerror!void {
         .modifier_pickups = try .init_with_capacity(round_arena.allocator(), 0),
         .visual_effects = try .init_with_capacity(round_arena.allocator(), 0),
         .distances_to_players = try .initCapacity(round_arena.allocator(), 0),
+        .players = ArrayList(Player).initBuffer(&_players_buffer),
+        .frame_arena = &frame_arena,
         .grid = grid,
         .random = prng.random(),
     };
 
-    var _players_buffer: [10]Player = undefined;
-    var players = ArrayList(Player).initBuffer(&_players_buffer);
-    players.appendAssumeCapacity(.{
+    state.players.appendAssumeCapacity(.{
         .cat = .empty_handle,
         .color = Color.green.brightness(0.8),
         .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
@@ -1068,7 +1505,7 @@ pub fn main() anyerror!void {
             .time_to_detonate = Duration.seconds(2),
         },
     });
-    players.appendAssumeCapacity(.{
+    state.players.appendAssumeCapacity(.{
         .cat = .empty_handle,
         .color = Color.blue.brightness(0.8),
         .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
@@ -1079,7 +1516,7 @@ pub fn main() anyerror!void {
             .time_to_detonate = Duration.seconds(2),
         },
     });
-    players.appendAssumeCapacity(.{
+    state.players.appendAssumeCapacity(.{
         .cat = .empty_handle,
         .color = Color.red.brightness(0.8),
         .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
@@ -1107,13 +1544,13 @@ pub fn main() anyerror!void {
                 },
                 '1'...'9' => {
                     const player_index = char - '1';
-                    if (player_index >= players.items.len) {
+                    if (player_index >= state.players.items.len) {
                         std.debug.print("Invalid player index: {c} at position: {f}. Maximum is: {d}\n", .{
-                            char, position, players.items.len,
+                            char, position, state.players.items.len,
                         });
                         return error.invalid_player_index;
                     }
-                    const player = &players.items[player_index];
+                    const player = &state.players.items[player_index];
                     if (state.cats.get(player.cat)) |cat| {
                         const previous_position = state.entities.get(cat.entity).?.position;
                         std.debug.print("Player {c} has the starting position defined a second time at: {f}. First time was: {f}.\n", .{
@@ -1123,11 +1560,10 @@ pub fn main() anyerror!void {
                     }
                     const player_cat = try state.create_cat(.{
                         .color = player.color,
-                        .controlling_player = &players.items[player_index],
+                        .controlling_player = &state.players.items[player_index],
                         .position = position,
                         .starting_health = Health{ .points = 15 },
                         .register_in_distance_map = true,
-                        .temporary_allocator = frame_arena.allocator(),
                     });
                     player.cat = player_cat;
                 },
@@ -1153,397 +1589,8 @@ pub fn main() anyerror!void {
     rl.setTargetFPS(60);
     //--------------------------------------------------------------------------------------
 
-    var thicness: f32 = 0.1;
-
     // Main game loop
-    while (!rl.windowShouldClose()) { // Detect window close button or ESC key
-        const current_time = Timestamp{ .seconds_from_beginning = rl.getTime() };
-        defer std.debug.assert(frame_arena.reset(.retain_capacity));
-
-        // Update
-        //----------------------------------------------------------------------------------
-        if (rl.isKeyPressed(.p)) {
-            pause = !pause;
-        }
-        if (rl.isKeyPressed(.f3)) {
-            DEBUG = !DEBUG;
-        }
-
-        thicness += rl.getMouseWheelMove() / 100;
-
-        if (!pause) {
-            // Update players
-            for (players.items) |*player| {
-                const cat = state.cats.get(player.cat) orelse continue;
-                const cat_position = state.get(cat.entity).?.position;
-                if (rl.isKeyPressed(player.controls.up)) cat.wanted_direction = .up;
-                if (rl.isKeyPressed(player.controls.left)) cat.wanted_direction = .left;
-                if (rl.isKeyPressed(player.controls.right)) cat.wanted_direction = .right;
-                if (rl.isKeyPressed(player.controls.down)) cat.wanted_direction = .down;
-                if (rl.isKeyPressed(player.controls.spawn_bomb)) {
-                    const no_other_bomb = for (state.grid.at(cat_position).items) |entity| {
-                        if (state.get(entity).?.type.tag() == .bomb) break false;
-                    } else true;
-                    if (no_other_bomb) {
-                        _ = try state.create_bomb(.{
-                            .current_time = current_time,
-                            .position = cat_position,
-                            .properties = player.bomb_creation_properties,
-                        });
-                    }
-                }
-            }
-
-            // Update cats
-            var it_cats = state.cats.iterator();
-            while (it_cats.next()) |entry| {
-                const cat, _ = entry;
-                const cat_entity: *Entity = state.get(cat.entity).?;
-                defer cat.wanted_direction = null;
-                const wanted_direction = cat.wanted_direction orelse continue;
-
-                const original_position = cat_entity.position;
-                var final_position = original_position;
-                search: while (true) {
-                    const next_position = final_position.add(wanted_direction);
-                    for (state.grid.at(next_position).items) |another_entity_handle| {
-                        _ = another_entity_handle;
-                        // FIXME: actually pickup the effect
-                        // if (another_entity.type.tag() != .modifier_pickup) break;
-                        break :search;
-                    }
-                    final_position = next_position;
-                }
-                if (!eql(original_position, final_position)) {
-                    _ = try state.create_visual_effect(.{
-                        .position = original_position,
-                        .timer_till_disappear = current_time.timer_that_goes_off_in(.seconds(0.3)),
-                        .type = .{ .after_dash = .{ .color = cat.color, .end_position = final_position, .direction = wanted_direction } },
-                    });
-                    state.move_assert_ok(cat.entity, final_position);
-                    if (cat.distances_map_handle) |map_handle| {
-                        state.recalculate_distances_from(frame_arena.allocator(), final_position, map_handle) catch |err| {
-                            comptime assert(@TypeOf(err) == Allocator.Error);
-                            std.log.warn("Out of memory when recalculating cat distances from: {f}. Cat handle: {any}", .{ final_position, entry.@"1" });
-                        };
-                    }
-                }
-            }
-
-            // Update enemies
-            var it_enemies = state.enemies.iterator();
-            enemies: while (it_enemies.next()) |entry| {
-                const enemy, const enemy_handle = entry;
-                _ = enemy_handle;
-                const entity: *Entity = state.entities.get(enemy.entity).?;
-
-                switch (enemy.type) {
-                    .normal => {
-                        if (!enemy.can_do_action(current_time)) continue :enemies;
-                        var best_position: ?Position = null;
-                        var best_distance = DistanceMap.infinity;
-                        for (&[_]Direction{ .up, .left, .down, .right }) |direction| {
-                            const position = entity.position.add(direction);
-                            var min_distance = DistanceMap.infinity;
-                            for (state.distances_to_players.items) |*distance_map| {
-                                min_distance = @min(min_distance, distance_map.distance_at(position));
-                            }
-                            if (min_distance < best_distance) {
-                                best_distance = min_distance;
-                                best_position = position;
-                            }
-                        }
-                        const pos = best_position orelse continue :enemies;
-                        if (best_distance == 0) {
-                            if (!enemy.can_hit(current_time)) continue :enemies;
-                            enemy.timer_until_next_possible_hit = current_time.timer_that_goes_off_in(enemy.interval_between_hits);
-                            _ = state.deal_damage_at(pos, enemy.melee_damage, enemy.entity);
-                        } else if (state.is_passable_at(pos)) {
-                            if (!enemy.can_move(current_time)) continue :enemies;
-                            enemy.timer_until_next_possible_movement = current_time.timer_that_goes_off_in(enemy.interval_between_movement);
-                            state.move_assert_ok(enemy.entity, pos);
-                        }
-                    },
-                }
-            }
-
-            // Update bombs
-            var it_bombs = state.bombs.iterator();
-            while (it_bombs.next()) |entry| {
-                const bomb_ptr, _ = entry;
-                if (!bomb_ptr.timer_till_explosion.finished(current_time)) continue;
-                const bomb = bomb_ptr; // Copy the bomb
-                const bomb_entity: *Entity = state.get(bomb.entity).?;
-
-                var starting_damage = bomb.damage;
-                _ = starting_damage.sub_mut(state.deal_damage_at(bomb_entity.position, bomb.damage, bomb.entity).damage_dealt);
-
-                const base_effect_timer = current_time.timer_that_goes_off_in(.seconds(0.3));
-                _ = try state.create_visual_effect(VisualEffect{
-                    .position = bomb_entity.position,
-                    .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
-                    .type = .fire,
-                });
-
-                directions: for (&[_]Direction{ .up, .left, .down, .right }) |direction| {
-                    var position = bomb_entity.position;
-                    var damage_to_deal = starting_damage;
-                    for (0..as(usize, bomb.blast_radius_in_tiles)) |_| {
-                        if (damage_to_deal.is_zero()) continue :directions;
-                        position = position.add(direction);
-                        const damage_dealt = state.deal_damage_at(position, bomb.damage, .empty_handle).damage_dealt;
-                        _ = damage_to_deal.sub_mut(damage_dealt);
-                        for (state.grid.at(position).items) |handle| {
-                            const entity = state.entities.get(handle).?;
-                            if (entity.type.tag() == .wall or entity.type.tag() == .bomb) continue :directions;
-                        }
-                        _ = try state.create_visual_effect(VisualEffect{
-                            .position = position,
-                            .timer_till_disappear = base_effect_timer.prolonged_by(.seconds(state.random.float(f32) * 0.3)),
-                            .type = .fire,
-                        });
-                    }
-                }
-
-                _ = state.remove_entity(bomb.entity);
-            }
-
-            // Update effect pickups
-            var it_modifier_pickups = state.modifier_pickups.iterator();
-            while (it_modifier_pickups.next()) |entry| {
-                const modifier_pickup, _ = entry;
-                if (!modifier_pickup.timer_till_disappear.finished(current_time)) continue;
-                assert(state.remove_entity(modifier_pickup.entity).removal_sucessful);
-            }
-        } else {
-            framesCounter += 1;
-        }
-        //----------------------------------------------------------------------------------
-
-        // Draw
-        //----------------------------------------------------------------------------------
-        rl.beginDrawing();
-        defer rl.endDrawing();
-
-        rl.clearBackground(.init(242, 242, 242, 255));
-
-        const tile_size_on_screen = game_view.scale_to_screen(1) * 1.02;
-        const lines_color = rl.Color.white;
-        const line_thickness = game_view.scale_to_screen(thicness);
-        {
-            // Draw horizontal tiles
-            for (0..@intCast(grid.height + 1)) |y_in_game| {
-                var start = game_view.screen_coordinates_from_position(.{ .x = 0, .y = @intCast(y_in_game) });
-                start = start.add(.{ .x = 0, .y = -line_thickness / 2 });
-                rl.drawRectangleV(start, .{ .x = game_view.on_screen.x_span(), .y = line_thickness }, lines_color);
-            }
-            // Draw vertical tiles
-            for (0..@intCast(grid.width + 1)) |x_in_game| {
-                var start = game_view.screen_coordinates_from_position(.{ .x = @intCast(x_in_game), .y = 0 });
-                start = start.add(.{ .x = -line_thickness / 2, .y = 0 });
-                rl.drawRectangleV(start, .{ .x = line_thickness, .y = game_view.on_screen.y_span() }, lines_color);
-            }
-        }
-
-        var it_visual_effects = state.visual_effects.iterator();
-        while (it_visual_effects.next()) |entry| {
-            const visual_effect, const visual_effect_handle = entry;
-            if (visual_effect.timer_till_disappear) |timer| if (timer.finished(current_time)) {
-                assert(state.visual_effects.remove(visual_effect_handle) != null);
-                continue;
-            };
-
-            const coords = game_view.screen_coordinates_from_position(visual_effect.position);
-            // const x_int = as(i32, coords.x);
-            // const y_int = as(i32, coords.y);
-
-            switch (visual_effect.type) {
-                .fire => {
-                    // const progress = visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time);
-                    // const scale = cap_0_1(std.math.pow(f32, 1 - progress, 2));
-                    const scale = 1;
-                    const rotation = state.random.float(f32) * 2 * pi;
-                    rl.drawTextureEx(fire_texture, coords, rotation, scale, .white);
-                },
-                .after_dash => |after_dash| {
-                    const start_color = rl.Color.white.alpha(0);
-                    var color_hsv = after_dash.color.brightness(-0.3).toHSV();
-                    color_hsv.y = std.math.sqrt(std.math.sqrt(color_hsv.y));
-                    const main_color = rl.Color.fromHSV(color_hsv.x, color_hsv.y, color_hsv.z);
-                    const end_color = main_color.alpha(1 - visual_effect.timer_till_disappear.?.progress_from_0_to_1(current_time));
-                    // const end_color = after_dash.color;
-                    const start_pos = visual_effect.position;
-                    const end_pos = after_dash.end_position;
-                    const width = game_view.scale_to_screen(as(f32, @abs(start_pos.x - end_pos.x) + 1));
-                    const height = game_view.scale_to_screen(as(f32, @abs(start_pos.y - end_pos.y) + 1));
-
-                    switch (after_dash.direction) {
-                        .down => {
-                            rl.drawRectangleGradientEx(
-                                .{
-                                    .x = coords.x,
-                                    .y = coords.y,
-                                    .height = height,
-                                    .width = width,
-                                },
-                                start_color,
-                                end_color,
-                                end_color,
-                                start_color,
-                            );
-                        },
-                        .up => {
-                            rl.drawRectangleGradientEx(
-                                .{
-                                    .x = coords.x - width + tile_size_on_screen,
-                                    .y = coords.y - height + tile_size_on_screen,
-                                    .height = height,
-                                    .width = width,
-                                },
-                                end_color,
-                                start_color,
-                                start_color,
-                                end_color,
-                            );
-                        },
-                        .left => {
-                            rl.drawRectangleGradientEx(
-                                .{
-                                    .x = coords.x - width + tile_size_on_screen,
-                                    .y = coords.y - height + tile_size_on_screen,
-                                    .height = height,
-                                    .width = width,
-                                },
-                                end_color,
-                                end_color,
-                                start_color,
-                                start_color,
-                            );
-                        },
-                        .right => {
-                            rl.drawRectangleGradientEx(
-                                .{
-                                    .x = coords.x,
-                                    .y = coords.y,
-                                    .height = height,
-                                    .width = width,
-                                },
-                                start_color,
-                                start_color,
-                                end_color,
-                                end_color,
-                            );
-                        },
-                    }
-                    // rl.drawRectangleGradientEx()
-                    // if (is_horizontal) {
-                    //     const height = tile_size_on_screen;
-                    //     const width = game_view.scale_to_screen(as(f32, after_dash.end_position.x - visual_effect.position.x + 1));
-                    //     const is_left = visual_effect.position.x < after_dash.end_position.x;
-                    //     rl.drawRectangleGradientH(
-                    //         x_int,
-                    //         y_int,
-                    //         as(i32, width),
-                    //         as(i32, height),
-                    //         if (is_left) start_color else end_color,
-                    //         if (!is_left) start_color else end_color,
-                    //     );
-                    // }
-                },
-            }
-        }
-
-        var tiles_iterator = grid.iterator();
-        while (tiles_iterator.next()) |item| {
-            const coords = game_view.screen_coordinates_from_position(item.position);
-            const x_int = as(i32, coords.x);
-            const y_int = as(i32, coords.y);
-            for (item.tile.items) |handle| {
-                const entity: *Entity = state.get(handle).?;
-                switch (entity.type) {
-                    .cat => |cat_handle| {
-                        const cat = state.get(cat_handle).?;
-                        rl.drawTexture(cat_texture, x_int, y_int, cat.color);
-                    },
-                    .enemy => |enemy_handle| {
-                        const enemy = state.get(enemy_handle).?;
-                        _ = enemy;
-                        // TODO: use a custom texture for enemies
-                        rl.drawTexture(cat_texture, x_int, y_int, .red);
-                    },
-                    .wall => {
-                        rl.drawRectangle(
-                            x_int,
-                            y_int,
-                            as(i32, tile_size_on_screen),
-                            as(i32, tile_size_on_screen),
-                            rl.Color.dark_blue.contrast(-0.6),
-                        );
-                    },
-                    .bomb => |bomb_handle| {
-                        const bomb = state.bombs.get(bomb_handle).?;
-                        const progress = bomb.timer_till_explosion.progress_from_0_to_1(current_time);
-
-                        rl.drawTexture(bomb_texture, x_int, y_int, rl.colorLerp(
-                            .white,
-                            rl.Color.red.brightness(0.3),
-                            progress,
-                        ));
-                    },
-                    .modifier_pickup => |pickup_handle| {
-                        const pickup = state.get(pickup_handle).?;
-                        rl.drawTexture(pickup.texture, x_int, y_int, .white);
-                    },
-                }
-            }
-
-            if (DEBUG) {
-                const distance = state.distances_to_players.items[0].distance_at(item.position);
-                if (distance == DistanceMap.infinity) {
-                    rl.drawText(
-                        "no",
-                        @intFromFloat(coords.x + 9),
-                        @intFromFloat(coords.y + 14),
-                        10,
-                        .red,
-                    );
-                } else {
-                    rl.drawText(
-                        std.fmt.allocPrintSentinel(frame_arena.allocator(), "{d}", .{distance}, 0) catch unreachable,
-                        @intFromFloat(coords.x + 12),
-                        @intFromFloat(coords.y + 14),
-                        10,
-                        .red,
-                    );
-                }
-                rl.drawText(
-                    std.fmt.allocPrintSentinel(frame_arena.allocator(), "{d},{d}", .{ item.position.x, item.position.y }, 0) catch unreachable,
-                    @intFromFloat(coords.x),
-                    @intFromFloat(coords.y),
-                    10,
-                    .red,
-                );
-            }
-        }
-
-        rl.drawText(
-            std.fmt.allocPrintSentinel(frame_arena.allocator(), "Health: {d}", .{
-                if (state.cats.get(players.items[0].cat)) |c| state.entities.get(c.entity).?.health.?.points else -1,
-            }, 0) catch unreachable,
-            120,
-            10,
-            20,
-            rl.Color.green,
-        );
-
-        // On pause, we draw a blinking message
-        if (pause and @mod(@divFloor(framesCounter, 30), 2) == 0) {
-            rl.drawText("PAUSED", 350, 200, 30, .gray);
-        }
-
-        rl.drawFPS(10, 10);
-        //----------------------------------------------------------------------------------
-    }
+    try single_round_main_loop(&state, &game_view, assets);
 }
 
 test {
