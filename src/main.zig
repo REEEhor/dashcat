@@ -16,6 +16,7 @@ const slices = @import("slices.zig");
 const Set = @import("set.zig").Set;
 
 const rl = @import("raylib");
+const rg = @import("raygui");
 
 const Vector2 = rl.Vector2;
 const Vector3 = rl.Vector3;
@@ -315,11 +316,14 @@ pub const Controls = struct {
     spawn_bomb: rl.KeyboardKey,
 };
 
+const max_teams_count = 32;
+
 pub const Player = struct {
     cat: Set(Cat).Handle,
     controls: Controls,
     bomb_creation_properties: Bomb.Properties,
     color: rl.Color,
+    team_id: u16,
 };
 
 pub fn FixedArray(comptime Item: type) type {
@@ -612,6 +616,7 @@ pub fn update_effect_pickups(state: *GameState, current_time: Timestamp) !void {
 pub const GameState = struct {
     gpa: Allocator,
     frame_arena: *ArenaAllocator,
+    round_allocator: Allocator,
 
     // Entities
     entities: Set(Entity),
@@ -621,6 +626,8 @@ pub const GameState = struct {
     modifier_pickups: Set(ModifierPickup),
 
     players: std.ArrayList(Player),
+
+    teams_count: u16,
 
     distances_to_players: std.ArrayList(DistanceMap),
 
@@ -645,6 +652,34 @@ pub const GameState = struct {
                 "Invalid handle type: {s}",
                 .{@typeName(Invalid)},
             )),
+        };
+    }
+
+    pub const WhichTeamsAreAliveResult = union(enum) {
+        none,
+        one: u16,
+        at_least_two,
+
+        pub const Tag = std.meta.Tag(@This());
+        pub fn tag(self: @This()) Tag {
+            return std.meta.activeTag(self);
+        }
+    };
+    pub fn which_teams_are_alive(self: *Self) WhichTeamsAreAliveResult {
+        var buffer = [_]bool{false} ** max_teams_count;
+        var is_team_alive = buffer[0..self.teams_count];
+
+        var any_team_alive: ?u16 = null;
+        for (self.players.items) |p| {
+            const is_alive = (self.get(p.cat) != null);
+            is_team_alive[p.team_id] |= is_alive;
+            if (is_alive) any_team_alive = p.team_id;
+        }
+        const alive_teams = std.mem.count(bool, is_team_alive, &.{true});
+        return switch (alive_teams) {
+            0 => .none,
+            1 => .{ .one = any_team_alive.? },
+            else => .at_least_two,
         };
     }
 
@@ -1017,7 +1052,6 @@ pub fn render(
 ) void {
     rl.beginDrawing();
     defer rl.endDrawing();
-
     rl.clearBackground(.init(242, 242, 242, 255));
 
     const tile_size_on_screen = game_view.scale_to_screen(1) * 1.02;
@@ -1267,12 +1301,22 @@ pub const Assets = struct {
     bomb_texture: rl.Texture,
 };
 
-pub fn single_round_main_loop(state: *GameState, game_view: *GameView, assets: Assets) !void {
+pub const RoundResult = struct {
+    // game_ended: struct { players_that_won: []usize },
+    quit: bool,
+};
+
+pub const GameMode = enum {
+    versus,
+    coop,
+};
+
+pub fn single_round_main_loop(state: *GameState, mode: GameMode, game_view: *GameView, assets: Assets) !RoundResult {
     var pause = false;
     var pause_frames_counter: usize = 0;
 
     while (true) {
-        if (rl.windowShouldClose()) return;
+        if (rl.windowShouldClose()) return .{ .quit = true };
         const current_time = Timestamp{ .seconds_from_beginning = rl.getTime() };
         defer std.debug.assert(state.frame_arena.reset(.retain_capacity));
 
@@ -1291,6 +1335,16 @@ pub fn single_round_main_loop(state: *GameState, game_view: *GameView, assets: A
             try update_enemies(state, current_time);
             try update_bombs(state, current_time);
             try update_effect_pickups(state, current_time);
+
+            const which_teams_are_alive = state.which_teams_are_alive();
+            switch (mode) {
+                .coop => if (which_teams_are_alive == .none or state.enemies.len == 0) {
+                    return .{ .quit = false };
+                },
+                .versus => if (which_teams_are_alive == .none or which_teams_are_alive.tag() == .one) {
+                    return .{ .quit = false };
+                },
+            }
         } else {
             pause_frames_counter += 1;
         }
@@ -1425,9 +1479,8 @@ pub fn main() anyerror!void {
     rl.initWindow(screen.width, screen.height, "Dash Cat");
     defer rl.closeWindow(); // Close window and OpenGL context
 
-    const grid = try Grid.init(round_arena.allocator(), 20, 20, 20);
     var game_view = GameView{
-        .in_game = .{ .min_x = 0, .min_y = 0, .max_x = @floatFromInt(grid.width), .max_y = @floatFromInt(grid.height) },
+        .in_game = .{ .min_x = 0, .min_y = 0, .max_x = 20, .max_y = 20 },
         .on_screen = .{ .min_x = 10, .min_y = 10, .max_x = 800 - 20, .max_y = 800 - 20 },
     };
 
@@ -1478,119 +1531,152 @@ pub fn main() anyerror!void {
 
     var _players_buffer: [10]Player = undefined;
 
-    var prng = std.Random.DefaultPrng.init(42);
-    var state = GameState{
-        .gpa = round_arena.allocator(),
-        .bombs = try .init_with_capacity(round_arena.allocator(), 0),
-        .cats = try .init_with_capacity(round_arena.allocator(), 0),
-        .entities = try .init_with_capacity(round_arena.allocator(), 0),
-        .enemies = try .init_with_capacity(round_arena.allocator(), 0),
-        .modifier_pickups = try .init_with_capacity(round_arena.allocator(), 0),
-        .visual_effects = try .init_with_capacity(round_arena.allocator(), 0),
-        .distances_to_players = try .initCapacity(round_arena.allocator(), 0),
-        .players = ArrayList(Player).initBuffer(&_players_buffer),
-        .frame_arena = &frame_arena,
-        .grid = grid,
-        .random = prng.random(),
-    };
-
-    state.players.appendAssumeCapacity(.{
-        .cat = .empty_handle,
-        .color = Color.green.brightness(0.8),
-        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
-        .bomb_creation_properties = Bomb.Properties{
-            .blast_radius_in_tiles = 2,
-            .damage = Health{ .points = 5 },
-            .starting_health = Health.indestructible,
-            .time_to_detonate = Duration.seconds(2),
-        },
-    });
-    state.players.appendAssumeCapacity(.{
-        .cat = .empty_handle,
-        .color = Color.blue.brightness(0.8),
-        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
-        .bomb_creation_properties = Bomb.Properties{
-            .blast_radius_in_tiles = 2,
-            .damage = Health{ .points = 5 },
-            .starting_health = Health.indestructible,
-            .time_to_detonate = Duration.seconds(2),
-        },
-    });
-    state.players.appendAssumeCapacity(.{
-        .cat = .empty_handle,
-        .color = Color.red.brightness(0.8),
-        .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
-        .bomb_creation_properties = Bomb.Properties{
-            .blast_radius_in_tiles = 2,
-            .damage = Health{ .points = 5 },
-            .starting_health = Health.indestructible,
-            .time_to_detonate = Duration.seconds(2),
-        },
-    });
-
-    for (0..@intCast(grid.height)) |y| {
-        for (0..@intCast(grid.width)) |x| {
-            const width: usize = @intCast(grid.width);
-            const map_index: usize = y * (width + 1) + x;
-            const char = game_map[map_index];
-            const position = Position{ .x = as(i32, x), .y = as(i32, y) };
-            switch (char) {
-                ' ' => {},
-                'w' => {
-                    _ = try state.create_wall_all(.{
-                        .position = position,
-                        .health = .indestructible,
-                    });
-                },
-                '1'...'9' => {
-                    const player_index = char - '1';
-                    if (player_index >= state.players.items.len) {
-                        std.debug.print("Invalid player index: {c} at position: {f}. Maximum is: {d}\n", .{
-                            char, position, state.players.items.len,
-                        });
-                        return error.invalid_player_index;
-                    }
-                    const player = &state.players.items[player_index];
-                    if (state.cats.get(player.cat)) |cat| {
-                        const previous_position = state.entities.get(cat.entity).?.position;
-                        std.debug.print("Player {c} has the starting position defined a second time at: {f}. First time was: {f}.\n", .{
-                            char, position, previous_position,
-                        });
-                        return error.player_starting_position_defined_multiple_times;
-                    }
-                    const player_cat = try state.create_cat(.{
-                        .color = player.color,
-                        .controlling_player = &state.players.items[player_index],
-                        .position = position,
-                        .starting_health = Health{ .points = 15 },
-                        .register_in_distance_map = true,
-                    });
-                    player.cat = player_cat;
-                },
-                'e' => {
-                    _ = try state.create_enemy(.{
-                        .position = position,
-                        .enemy_type = .normal,
-                        .health = Health{ .points = 5 },
-                        .melee_damage = Health{ .points = 4 },
-                        .interval_between_hits = Duration.seconds(0.8),
-                        .interval_between_movement = Duration.seconds(1.1),
-                        .current_time = Timestamp{ .seconds_from_beginning = rl.getTime() },
-                    });
-                },
-                else => {
-                    std.debug.print("Invalid character '{c}' at position: {f}\n", .{ char, position });
-                    return error.invalid_character;
-                },
-            }
-        }
-    }
-
     rl.setTargetFPS(60);
     //--------------------------------------------------------------------------------------
 
-    // Main game loop
-    try single_round_main_loop(&state, &game_view, assets);
+    while (true) {
+
+        // Main menu
+        while (true) {
+            rl.beginDrawing();
+            defer rl.endDrawing();
+            rl.clearBackground(.init(242, 242, 242, 255));
+            if (rl.windowShouldClose()) return;
+
+            const button_width = 400;
+            const button_height = 50;
+
+            const play_clicked = rg.button(.{
+                .x = game_view.on_screen.x_span() / 2 - button_width / 2,
+                .y = game_view.on_screen.y_span() / 2 - button_height,
+                .height = button_height,
+                .width = button_width,
+            }, "Play!");
+            if (play_clicked) break;
+        }
+
+        // Init
+        const grid = try Grid.init(round_arena.allocator(), 20, 20, 20);
+        var prng = std.Random.DefaultPrng.init(42);
+        var state = GameState{
+            .gpa = round_arena.allocator(),
+            .bombs = try .init_with_capacity(round_arena.allocator(), 0),
+            .cats = try .init_with_capacity(round_arena.allocator(), 0),
+            .entities = try .init_with_capacity(round_arena.allocator(), 0),
+            .enemies = try .init_with_capacity(round_arena.allocator(), 0),
+            .modifier_pickups = try .init_with_capacity(round_arena.allocator(), 0),
+            .visual_effects = try .init_with_capacity(round_arena.allocator(), 0),
+            .distances_to_players = try .initCapacity(round_arena.allocator(), 0),
+            .players = ArrayList(Player).initBuffer(&_players_buffer),
+            .frame_arena = &frame_arena,
+            .teams_count = 1,
+            .round_allocator = round_arena.allocator(),
+            .grid = grid,
+            .random = prng.random(),
+        };
+
+        state.players.appendAssumeCapacity(.{
+            .cat = .empty_handle,
+            .color = Color.green.brightness(0.8),
+            .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
+            .bomb_creation_properties = Bomb.Properties{
+                .blast_radius_in_tiles = 2,
+                .damage = Health{ .points = 5 },
+                .starting_health = Health.indestructible,
+                .time_to_detonate = Duration.seconds(2),
+            },
+            .team_id = 0,
+        });
+        state.players.appendAssumeCapacity(.{
+            .cat = .empty_handle,
+            .color = Color.blue.brightness(0.8),
+            .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
+            .bomb_creation_properties = Bomb.Properties{
+                .blast_radius_in_tiles = 2,
+                .damage = Health{ .points = 5 },
+                .starting_health = Health.indestructible,
+                .time_to_detonate = Duration.seconds(2),
+            },
+            .team_id = 0,
+        });
+        state.players.appendAssumeCapacity(.{
+            .cat = .empty_handle,
+            .color = Color.red.brightness(0.8),
+            .controls = Controls{ .up = .w, .left = .a, .down = .s, .right = .d, .spawn_bomb = .space },
+            .bomb_creation_properties = Bomb.Properties{
+                .blast_radius_in_tiles = 2,
+                .damage = Health{ .points = 5 },
+                .starting_health = Health.indestructible,
+                .time_to_detonate = Duration.seconds(2),
+            },
+            .team_id = 0,
+        });
+
+        for (0..@intCast(grid.height)) |y| {
+            for (0..@intCast(grid.width)) |x| {
+                const width: usize = @intCast(grid.width);
+                const map_index: usize = y * (width + 1) + x;
+                const char = game_map[map_index];
+                const position = Position{ .x = as(i32, x), .y = as(i32, y) };
+                switch (char) {
+                    ' ' => {},
+                    'w' => {
+                        _ = try state.create_wall_all(.{
+                            .position = position,
+                            .health = .indestructible,
+                        });
+                    },
+                    '1'...'9' => {
+                        const player_index = char - '1';
+                        if (player_index >= state.players.items.len) {
+                            std.debug.print("Invalid player index: {c} at position: {f}. Maximum is: {d}\n", .{
+                                char, position, state.players.items.len,
+                            });
+                            return error.invalid_player_index;
+                        }
+                        const player = &state.players.items[player_index];
+                        if (state.cats.get(player.cat)) |cat| {
+                            const previous_position = state.entities.get(cat.entity).?.position;
+                            std.debug.print("Player {c} has the starting position defined a second time at: {f}. First time was: {f}.\n", .{
+                                char, position, previous_position,
+                            });
+                            return error.player_starting_position_defined_multiple_times;
+                        }
+                        const player_cat = try state.create_cat(.{
+                            .color = player.color,
+                            .controlling_player = &state.players.items[player_index],
+                            .position = position,
+                            .starting_health = Health{ .points = 15 },
+                            .register_in_distance_map = true,
+                        });
+                        player.cat = player_cat;
+                    },
+                    'e' => {
+                        _ = try state.create_enemy(.{
+                            .position = position,
+                            .enemy_type = .normal,
+                            .health = Health{ .points = 5 },
+                            .melee_damage = Health{ .points = 4 },
+                            .interval_between_hits = Duration.seconds(0.8),
+                            .interval_between_movement = Duration.seconds(1.1),
+                            .current_time = Timestamp{ .seconds_from_beginning = rl.getTime() },
+                        });
+                    },
+                    else => {
+                        std.debug.print("Invalid character '{c}' at position: {f}\n", .{ char, position });
+                        return error.invalid_character;
+                    },
+                }
+            }
+        }
+
+        // Main game loop
+        const result = try single_round_main_loop(&state, .coop, &game_view, assets);
+        if (result.quit) break;
+
+        _ = round_arena.reset(.retain_capacity);
+        _ = frame_arena.reset(.retain_capacity);
+    }
 }
 
 test {
